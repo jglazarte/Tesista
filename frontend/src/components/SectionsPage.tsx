@@ -1288,7 +1288,7 @@ export const SectionsPage = ({ newSignal = 0 }: { newSignal?: number }) => {
 
                   {report.uncitedSources.length > 0 && (
                     <div className="mb-4">
-                      <h3 className="mb-2 text-sm font-semibold">Fuentes sin citas registradas</h3>
+                      <h3 className="mb-2 text-sm font-semibold">Fuentes sin citas vinculadas a secciones</h3>
                       <ul className="space-y-1 text-sm">
                         {report.uncitedSources.map((s) => (
                           <li key={s.id} className="flex justify-between gap-2 text-muted-foreground">
@@ -1309,7 +1309,7 @@ export const SectionsPage = ({ newSignal = 0 }: { newSignal?: number }) => {
                           <th className="py-2 text-right">Propias</th>
                           <th className="py-2 text-right">Evidencias</th>
                           <th className="py-2 text-right">Total</th>
-                          <th className="py-2 text-right">Objetivo</th>
+                          <th className="py-2 text-right">Avance</th>
                         </tr>
                       </thead>
                       <tbody>

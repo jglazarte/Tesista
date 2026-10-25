@@ -3,6 +3,8 @@
 **Plataforma de gestión de conocimiento, referencias y cruce de datos para tesis doctorales**  
 *(Combinando lo mejor de Zotero, Obsidian y Notion sin manejo de imágenes ni elementos distractores)*
 
+> **Estado:** los seis hitos están completos y todo el flujo de trabajo se realiza desde el navegador. El repositorio versiona únicamente código, configuración y la base de datos local; dependencias y artefactos de build quedan fuera del historial.
+
 ---
 
 ## 1. Descripción del Proyecto
@@ -26,12 +28,17 @@ El sistema está optimizado para **texto plano, metadatos estructurados, citas b
 tesista/
 ├── tesista.md              # Plan de desarrollo original (milestones 1-6)
 ├── README.md               # Este archivo
-├── .gitignore              # Excluye dependencias y artefactos generados
-├── package.json            # Dependencias del núcleo (Node.js)
+├── .gitignore              # Excluye dependencias, builds y salidas generadas
+├── package.json            # Scripts y dependencias del núcleo (Node.js)
 ├── tsconfig.json           # Configuración TypeScript
-├── data/                   # Base SQLite local (tesista.db)
-├── backups/                # Respaldos .tar.gz generados desde la UI
-├── export/                 # Capítulos exportados desde la UI
+├── data/
+│   └── tesista.db          # Base SQLite local (versionada)
+├── docs/
+│   └── images/             # Capturas usadas en la guía de uso
+├── scripts/
+│   └── start-tesista.sh    # Arranca backend y frontend en paralelo
+├── backups/                # (generado, ignorado) respaldos .tar.gz desde la UI
+├── export/                 # (generado, ignorado) capítulos exportados desde la UI
 │
 ├── src/                    # Capa de datos (Node.js + SQLite + TypeScript)
 │   ├── types.ts            # Tipos de dominio compartidos
@@ -44,25 +51,27 @@ tesista/
 │   ├── query-parser.ts     # Parser de consultas declarativas (Hito 5)
 │   ├── csl.ts              # Motor CSL: APA, Chicago, IEEE, MLA, Nature (Hito 5)
 │   ├── pandoc.ts           # Wrapper Pandoc para exportación (Hito 5)
-│   ├── export.ts           - Exportación académica: YAML frontmatter, BibTeX pruning (Hito 5)
-│   ├── cascade.ts          - Actualización en cascada de citekeys y títulos (Hito 6)
-│   ├── integrity.ts        - Diagnóstico de enlaces rotos y huérfanos (Hito 6)
-│   ├── fts.ts              - Búsqueda de texto completo FTS5 (Hito 6)
-│   ├── backup.ts           - Respaldos .tar.gz (Hito 6)
-│   ├── git.ts              - Integración Git (Hito 6)
+│   ├── export.ts           # Exportación académica: YAML frontmatter, BibTeX pruning (Hito 5)
+│   ├── cascade.ts          # Actualización en cascada de citekeys y títulos (Hito 6)
+│   ├── integrity.ts        # Diagnóstico de enlaces rotos y huérfanos (Hito 6)
+│   ├── fts.ts              # Búsqueda de texto completo FTS5 (Hito 6)
+│   ├── backup.ts           # Respaldos .tar.gz (Hito 6)
+│   ├── git.ts              # Integración Git (Hito 6)
 │   └── editor/             # Esqueleto de extensiones TipTap para el editor de notas
 │       └── tiptap-extensions.ts
 │
 ├── server/                 # API REST (Express + TypeScript)
 │   ├── package.json
 │   ├── tsconfig.json
-│   └── src/index.ts        # Endpoints REST para todos los recursos
+│   ├── src/index.ts        # Endpoints REST para todos los recursos
+│   └── dist/               # (generado, ignorado) build del servidor
 │
 └── frontend/               # Interfaz de usuario (React + Vite + Tailwind CSS)
     ├── package.json
     ├── vite.config.mts     # Configuración Vite (ESM) con proxy /api → 3001
     ├── postcss.config.js
     ├── tsconfig.json
+    ├── tsconfig.node.json
     ├── index.html
     └── src/
         ├── main.tsx
@@ -73,7 +82,7 @@ tesista/
             ├── Sidebar.tsx             (navegación lateral colapsable)
             ├── SourcesPage.tsx         (fuentes, DOI, citas y etiquetas)
             ├── NotesPage.tsx           (editor de notas con wikilinks, @citekey, transclusión y etiquetas)
-            ├── SectionsPage.tsx        (árbol jerárquico, evidencias, progreso y Gap Checker)
+            ├── SectionsPage.tsx        (árbol jerárquico, evidencias, progreso, Gap Checker y exportación)
             ├── MatrixPage.tsx          (matriz de síntesis y gestor de etiquetas)
             └── SettingsPage.tsx        (tema, mantenimiento, respaldos y Git)
 ```
@@ -155,10 +164,16 @@ tesista/
 
 ### Opción 1: Usando el alias `tesista` (recomendado)
 
-El alias `tesista` está configurado en `~/.zshrc`. Simplemente ejecuta:
+Si ya tenés el alias configurado, ejecutalo desde cualquier carpeta:
 
 ```zsh
 tesista
+```
+
+Para crearlo en otro equipo, agregá esta línea a `~/.zshrc` (ajustá la ruta a tu clon):
+
+```zsh
+alias tesista='cd ~/Tesista && npm start'
 ```
 
 Esto iniciará ambos servicios en paralelo:
@@ -171,8 +186,10 @@ Presiona `Ctrl+C` para detener ambos servicios.
 
 #### Backend (Servidor API)
 
+Desde la raíz del repositorio:
+
 ```bash
-cd /home/guille/Proyectos/Tesista/server
+cd server
 npm install
 npm run dev          # desarrollo con recarga (tsx watch)
 ```
@@ -188,8 +205,10 @@ npm start            # node dist/server/src/index.js
 
 #### Frontend (Interfaz de Usuario)
 
+Desde la raíz del repositorio:
+
 ```bash
-cd /home/guille/Proyectos/Tesista/frontend
+cd frontend
 npm install
 npm run dev
 ```
@@ -213,12 +232,13 @@ npm run typecheck      # verifica el núcleo
 npm start              # inicia ambos servicios con scripts/start-tesista.sh
 ```
 
+> **Dependencias y artefactos:** el repositorio no versiona `node_modules/` ni builds. Al clonar, ejecutá `npm install` en la raíz (CLI), en `server/` y en `frontend/`; `npm start` instala automáticamente las dependencias de estos dos últimos si faltan. La base `data/tesista.db` sí se versiona.
+
 ### Opción 3: CLI (capa de datos directa)
 
-El núcleo también incluye una interfaz de línea de comandos para pruebas y uso directo:
+El núcleo también incluye una interfaz de línea de comandos para pruebas y uso directo. Desde la raíz del repositorio:
 
 ```bash
-cd /home/guille/Proyectos/Tesista
 npm install
 npm run build        # compila TypeScript a dist/
 
@@ -238,62 +258,198 @@ node dist/index.js export-bibtex
 
 ---
 
-## 5. Cómo Usar el Sistema
+## 5. Guía de uso
 
-### 1. Gestión de Bibliografía (Hito 1)
+Esta sección recorre el flujo completo, desde el primer arranque hasta la exportación y el respaldo. Las capturas corresponden a una base de demostración y viven en `docs/images/`; podés reemplazarlas por las tuyas conservando el nombre del archivo.
 
-1. Ve a **Biblioteca** en la barra lateral
-2. Haz clic en **Nueva Fuente** para agregar una referencia
-3. Completa título, autores, año, DOI (opcional) y estado de lectura
-4. El sistema genera automáticamente la clave BibTeX (ej. `foucault1975`)
-5. Usa **Importar DOI** para traer metadatos desde CrossRef/OpenAlex
-6. Seleccioná una fuente para agregar citas con **Página/Localizador** obligatorio y etiquetas
+### 5.1 Primer arranque
 
-### 2. Notas Atómicas (Hito 2)
+1. Desde la raíz del repositorio ejecutá `npm start` (o el alias `tesista`).
+2. Abrí [http://localhost:5173](http://localhost:5173) en el navegador.
+3. La app usa `data/tesista.db`; si no existe, crea la base y el esquema.
+4. `Ctrl+C` detiene el backend y el frontend.
 
-1. Ve a **Notas Atómicas** en la barra lateral
-2. Haz clic en **Nueva Nota**
-3. Completa título, contenido Markdown y opcionalmente etiquetas separadas por comas
-4. Usa `[[Título de nota]]` para enlazar a otras notas
-5. Usa `@claveBibTeX` para mencionar fuentes bibliográficas
-6. Usa `!@claveBibTeX#página` para incrustar una cita textual como bloque de cita
-7. Guardá con el botón o con `Ctrl/⌘ + S`; consultá **Backlinks** al pie del editor
-8. La búsqueda de la lista filtra por título, contenido y etiquetas
+> Si la interfaz carga pero no muestra datos, el backend no está respondiendo. Revisá la sección 5.11.
 
-### 3. Estructura de Tesis (Hito 4)
+![Dashboard de Tesista](docs/images/01-dashboard.png)
+*Dashboard: conteos de fuentes, citas, notas, secciones, etiquetas y enlaces, con acciones rápidas.*
 
-1. Ve a **Capítulos**
-2. Crea Partes, Capítulos, Secciones y Subsecciones
-3. Reordena con las flechas **Subir/Bajar** y cambia el padre desde **Editar datos**
-4. Vincula evidencias (citas o notas) a cada sección
-5. Define un objetivo de palabras y seguí la barra de progreso
-6. Usa **Gap Checker** para detectar secciones huérfanas y fuentes no citadas
+### 5.2 Mapa de la interfaz
 
-### 4. Matriz de Síntesis (Hito 3)
+| Elemento | Para qué sirve |
+|---|---|
+| Menú lateral | Dashboard, Biblioteca, Notas Atómicas, Capítulos, Matriz de Síntesis y Configuración. La flecha superior lo colapsa. |
+| Barra superior | Título de la página y **Recargar** para volver a leer los datos del backend. |
+| Panel derecho | Detalle y edición del elemento seleccionado (fuente, nota o celda de matriz). |
+| Modales | Crear fuente, nota o sección; importar DOI; exportar; reportes. |
 
-1. Abre **Matriz de Síntesis**
-2. Elegí el tipo de etiqueta (concepto, metodología, postura, personalizada)
-3. Hacé clic en una celda con número para ver las citas y notas que la componen
-4. Usa **Etiquetas** para crear, renombrar o eliminar etiquetas del vocabulario
+### 5.3 Flujo de trabajo recomendado
 
-### 5. Exportación Académica (Hito 5)
+1. **Cargar fuentes** en Biblioteca, a mano o importando el DOI (§5.4).
+2. **Extraer citas textuales** con localizador obligatorio (§5.4).
+3. **Escribir notas atómicas** que enlacen notas y transcluyan citas (§5.5).
+4. **Etiquetar** fuentes, citas y notas, y revisar el cruce en la matriz (§5.7).
+5. **Armar los capítulos**, escribir texto propio y vincular evidencias (§5.8).
+6. **Revisar cobertura**, exportar el capítulo y crear un respaldo (§5.9 y §5.10).
 
-1. Ve a **Capítulos**, seleccioná una sección y hacé clic en **Exportar**
-2. Completá título, autor, fecha y estilo de cita (APA, Chicago, IEEE, MLA, Nature)
-3. Elegí si incluir la bibliografía podada y si guardar el archivo en `export/`
-4. La exportación genera Markdown con:
-   - YAML Frontmatter (título, autor, fecha, abstract, idioma)
-   - Citas resueltas según el estilo seleccionado
-   - Bibliografía podada (solo fuentes citadas en el texto)
-5. Podés **Descargar Markdown** directamente desde el navegador o convertir a PDF, LaTeX, DOCX o Typst mediante Pandoc (si está instalado)
+Cada paso alimenta al siguiente: una cita queda disponible como evidencia, una nota puede enlazar varias fuentes y una sección combina texto propio con citas y notas.
 
-### 6. Configuración (Hito 6)
+### 5.4 Biblioteca
 
-1. Ve a **Configuración**
-2. **General**: activa modo oscuro y autoguardado de notas
-3. **Base de datos**: consulta conteos, ejecuta `VACUUM` y genera el reporte de integridad
-4. **Respaldos**: crea un `.tar.gz` con la base, JSON de tablas y notas en Markdown
-5. **Git**: inicializa el repositorio, revisa cambios, crea commits y consulta el historial/diffs
+![Biblioteca](docs/images/02-biblioteca.png)
+*Biblioteca con el panel de citas y etiquetas de una fuente.*
+
+**Crear una fuente a mano**
+
+1. **Biblioteca → Nueva fuente**.
+2. Completá **Título** (obligatorio) y **Autores** separados por punto y coma: `Pérez, Ana; Gómez, Luis`.
+3. Agregá año, revista/libro, editorial, tipo BibTeX y estado de lectura.
+4. La **citekey** se genera sola (`foucault1975`, con sufijo `a`, `b` si se repite); también podés escribir una propia.
+5. Guardá. La fuente aparece en la tabla con su estado.
+
+**Importar por DOI**
+
+1. **Importar DOI**, pegá el DOI (`10.1000/xyz123`) y confirmá.
+2. Se consulta CrossRef y, si falla, OpenAlex.
+3. Revisá los metadatos recuperados y guardá. Si el DOI ya existe, se abre la fuente existente.
+
+![Importar por DOI](docs/images/03-importar-doi.png)
+*Importación de metadatos por DOI.*
+
+**Agregar citas y etiquetas**
+
+1. En la fila de la fuente, **Citas** abre el panel derecho.
+2. En **Nueva cita** escribí el texto exacto, el **localizador** (`p. 45`, `§ 2.3`, `párr. 4`) y, si querés, contexto y etiquetas.
+3. **Agregar cita**. El localizador es obligatorio: sin él el botón queda deshabilitado.
+4. Las etiquetas se agregan en el campo **Etiqueta…** con `Enter` o coma; la `×` las quita.
+5. Los iconos de lápiz y papelera editan o eliminan.
+
+> Las citas son la unidad de trazabilidad: cada evidencia de un capítulo apunta a una cita con página o a una nota.
+
+### 5.5 Notas atómicas
+
+![Editor de notas](docs/images/04-nota.png)
+*Editor con etiquetas, Markdown y backlinks.*
+
+1. **Notas Atómicas → Nueva** (o **Nueva nota** en el Dashboard).
+2. Escribí un título y el contenido en Markdown.
+3. Etiquetá con el campo **Otra etiqueta…** (`Enter` o coma).
+4. Guardá con **Guardar** o `Ctrl/⌘ + S`. El indicador muestra *Cambios sin guardar* o *Guardado · N palabras*.
+5. Con **Autoguardado** activo (Configuración), guarda 1,5 s después de dejar de escribir.
+6. Al pie aparecen los **backlinks**: notas que enlazan a la actual.
+
+**Sintaxis**
+
+| Sintaxis | Ejemplo | Efecto |
+|---|---|---|
+| Wikilink | `[[Biopolítica y cuerpo]]` | Enlaza otra nota por título. |
+| Alias | `[[Biopolítica y cuerpo\|biopoder]]` | Enlace con texto visible distinto. |
+| Mención | `@foucault1975` | Referencia una fuente por citekey. |
+| Transclusión | `!@foucault1975#p. 34` | Inserta el texto de la cita con ese localizador. |
+
+Los botones `[[Nota]]`, `@citekey` y `!@citekey#loc` de la barra inferior insertan la sintaxis en el cursor.
+
+> Al renombrar el título de una nota o una citekey, la actualización en cascada reescribe las referencias en todo el corpus.
+
+### 5.6 Búsqueda y filtros
+
+- **Biblioteca**: filtra en vivo por título, autor, citekey o DOI.
+- **Notas**: filtra por título, contenido y etiquetas; el contador indica cuántas quedan.
+- **Capítulos**: busca secciones por título dentro del árbol.
+- **Matriz**: el selector **Etiquetas** define qué tipo de etiqueta se usa como columnas.
+
+La búsqueda de texto completo FTS5 también está disponible por API (`POST /api/search/fts`, §6).
+
+### 5.7 Matriz de síntesis
+
+![Matriz de síntesis](docs/images/05-matriz.png)
+*Cruce de fuentes y etiquetas; al abrir una celda se listan sus citas y notas.*
+
+1. Abrí **Matriz de Síntesis**.
+2. Elegí el tipo de etiqueta en **Etiquetas:** (Conceptos, Metodologías, Posturas, Personalizadas).
+3. Ajustá **Máx. filas** y usá **Reconstruir** para recalcular.
+4. Cada fila es una fuente y cada columna una etiqueta; el número indica cuántas citas o notas cruzan esa combinación.
+5. Clic en un número abre el detalle con el texto de cada ítem y su localizador.
+6. **Etiquetas** abre el gestor: crear (nombre + tipo), renombrar y eliminar. Eliminar una etiqueta quita sus vínculos.
+
+### 5.8 Capítulos y evidencias
+
+![Capítulos](docs/images/06-capitulos.png)
+*Árbol jerárquico y editor de una sección con métricas de palabras.*
+
+1. **Capítulos → Nueva** y elegí el tipo: **Parte**, **Capítulo**, **Sección** o **Subsección**.
+2. Definí el **Padre** (o *Sin padre* para una raíz) y el **Objetivo de palabras**.
+3. Seleccioná un nodo para editar título, tipo, padre y objetivo en **Editar datos**.
+4. Reordená entre hermanos con las flechas ↑/↓; el orden se guarda al instante.
+5. Escribí el **Contenido propio** y guardá. El encabezado muestra palabras propias, de evidencias, total y el avance hacia el objetivo.
+6. En **Evidencias vinculadas**, elegí una nota o cita en el selector, **Agregar**, y quitá con el icono de papelera.
+
+![Evidencias](docs/images/07-evidencias.png)
+*Evidencias vinculadas y progreso de palabras de la sección.*
+
+**Reporte de cobertura (Gap Checker)**
+
+El icono de alerta en la cabecera del árbol (junto al de recarga) abre el reporte:
+
+![Reporte de cobertura](docs/images/08-cobertura.png)
+*Secciones sin evidencias, fuentes sin citas vinculadas y balance por capítulo.*
+
+- **Secciones huérfanas**: sin contenido propio ni evidencias.
+- **Fuentes sin citas vinculadas**: fuentes archivadas (`filed`) cuyas citas no llegaron a ninguna sección.
+- **Balance por capítulo**: palabras propias, de evidencias, total y avance.
+
+### 5.9 Exportar un capítulo
+
+![Exportar capítulo](docs/images/09-exportar.png)
+*Exportación con metadatos, estilo de cita y formato de salida.*
+
+1. Seleccioná la sección y usá **Exportar** (incluye la sección y sus subsecciones).
+2. Completá título del documento, autor, fecha, estilo de cita y resumen opcional.
+3. Marcá **Incluir bibliografía podada** para agregar solo las fuentes citadas.
+4. Marcá **Guardar el archivo en el servidor** y elegí formato: Markdown, LaTeX, PDF, Word o Typst.
+5. **Exportar** genera el resultado; **Descargar Markdown** lo baja desde el navegador.
+
+La salida incluye frontmatter YAML, citas resueltas y bibliografía. Los formatos distintos de Markdown requieren **Pandoc** instalado; la carpeta por defecto es `export/`.
+
+### 5.10 Configuración y respaldos
+
+![Configuración](docs/images/10-configuracion.png)
+*Conteos, mantenimiento, integridad, respaldos y Git.*
+
+**General**
+
+- **Modo oscuro**: cambia la paleta de toda la app.
+- **Autoguardado de notas**: guarda 1,5 s después de dejar de escribir.
+
+**Base de datos**
+
+- **Actualizar conteos**: relee fuentes, citas, notas, secciones, etiquetas y enlaces.
+- **Compactar (VACUUM)**: recupera espacio del archivo SQLite.
+- **Verificar integridad**: enlaces rotos, secciones huérfanas, fuentes sin citas y citekeys duplicadas.
+
+**Respaldos**
+
+1. Opcional: indicá una ruta de salida (por defecto `backups/tesista-<fecha>.tar.gz`).
+2. **Crear respaldo ahora**.
+3. El `.tar.gz` incluye la base con checkpoint del WAL, JSON de las tablas, notas en Markdown y un manifiesto.
+
+> `backups/` y `export/` están ignorados por Git para no versionar datos personales ni salidas generadas.
+
+**Git**
+
+- Muestra si el repositorio está **Limpio**, con **N cambios** o **No inicializado**.
+- **Inicializar repositorio**, **Actualizar estado**, mensaje + **Commit**, e **Historial** con **Diff** por commit.
+
+### 5.11 Problemas frecuentes
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| La interfaz carga pero no hay datos | Backend detenido o en otro puerto | Verificá `curl http://127.0.0.1:3001/api/stats`; reiniciá con `npm start`. |
+| «EADDRINUSE» al arrancar | Puerto 3001 o 5173 ocupado | `lsof -i :3001 -i :5173` y cerrá el proceso anterior. |
+| «database is locked» | Otra instancia usa la misma base | Cerrá la otra instancia; los archivos `-wal`/`-shm` se regeneran solos. |
+| El DOI no se importa | DOI inexistente o API caída | Cargá la fuente a mano; el resto de la app sigue funcionando. |
+| La exportación a PDF/DOCX falla | Pandoc no instalado | Instalá Pandoc o exportá en Markdown. |
+| Quiero empezar de cero | Datos de prueba | Creá un respaldo, renombrá `data/tesista.db` y reiniciá: se genera una base vacía. |
 
 ---
 
@@ -423,16 +579,15 @@ El backend expone los siguientes endpoints REST:
 - Editor enriquecido con TipTap (el editor actual es Markdown plano)
 - Migraciones de esquema versionadas y tests automatizados
 - Paginación en listados grandes y optimización de consultas del árbol/matriz
-- Botón de exportación de capítulos directamente desde la UI
 - Soporte para archivos CSL externos (.csl)
 - Sincronización con Git remoto
-- Exportación directa a LaTeX con BibTeX
+- Exportación de un archivo `.bib` separado para LaTeX
 
 ---
 
 ## 10. Licencia
 
-MIT License - Véase el archivo LICENSE para más detalles.
+ISC — según el campo `license` de `package.json`. El repositorio todavía no incluye un archivo `LICENSE`.
 
 ---
 

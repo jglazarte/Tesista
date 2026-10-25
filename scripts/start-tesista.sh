@@ -1,9 +1,9 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 # Script para iniciar Tesista (backend + frontend) en paralelo
 
 set -e
 
-PROJECT_DIR="/home/guille/Proyectos/Tesista"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="$PROJECT_DIR/server"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 

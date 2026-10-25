@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "dev:server": "npm --prefix server run dev",
     "dev:frontend": "npm --prefix frontend run dev",
-    "start": "zsh scripts/start-tesista.sh"
+    "start": "bash scripts/start-tesista.sh"
   },
   "keywords": [],
   "author": "",

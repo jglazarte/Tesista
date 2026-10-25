@@ -26,6 +26,13 @@ const splitAuthors = (raw: string) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
+const READ_STATUS_LABELS: Record<Source["readStatus"], string> = {
+  unread: "No leído",
+  reading: "Leyendo",
+  read: "Leído",
+  filed: "Archivado",
+};
+
 const emptySourceForm = (): NewSource => ({
   title: "",
   authors: [],
@@ -400,7 +407,7 @@ export const SourcesPage = ({ newSignal = 0 }: { newSignal?: number }) => {
                   <td className="px-3 py-2 tabular-nums">{source.year ?? "—"}</td>
                   <td className="px-3 py-2">
                     <span className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                      {source.readStatus}
+                      {READ_STATUS_LABELS[source.readStatus] ?? source.readStatus}
                     </span>
                   </td>
                   <td className="px-3 py-2">
