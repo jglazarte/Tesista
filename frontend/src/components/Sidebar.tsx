@@ -1,8 +1,10 @@
+"use client";
+
 import { useState } from "react";
 import {
+  LayoutDashboard,
   BookOpen,
   FileText,
-  LayoutDashboard,
   SquareKanban,
   ShieldAlert,
   Settings,
