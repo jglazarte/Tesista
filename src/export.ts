@@ -181,32 +181,31 @@ export function resolveCitationsInText(
   // 1. Resolver grupos de citas entre paréntesis: (@key1#loc1; @key2#loc2)
   let resolved = resolveCitationGroupsInText(db, text, styleId);
 
-  // 2. Resolver transclusiones: !@clave#locator -> bloque de cita
-  // El localizador se captura hasta el punto y coma, paréntesis de cierre o final
+  // 2. Resolver transclusiones: !@clave#locator -> bloque de cita.
+  //    El localizador puede contener espacios ("p. 45") y termina en ;, ) o salto de línea.
   resolved = resolved.replace(
-    /!?@([A-Za-z0-9_\-]+)#([^;\)]*)/g,
+    /!@([A-Za-z0-9_\-]+)#([^;)\n]+)/g,
     (_match, citekey, locator) => {
       const trimmedLocator = locator.trim();
       const source = db.getSourceByCitekey(citekey);
       if (!source || !source.id) return `[Fuente no encontrada: ${citekey}]`;
-      const excerpts = db.listExcerptsBySource(source.id);
-      const excerpt = excerpts.find((e) => e.locator === trimmedLocator);
+      const excerpt = db.findExcerptByLocator(source.id, trimmedLocator);
       if (!excerpt) return `[Cita no encontrada: ${citekey}#${trimmedLocator}]`;
       if (!citedExcerptIds.has(excerpt.id!)) {
         citedExcerptIds.add(excerpt.id!);
         citedExcerpts.push(excerpt);
       }
-      return `\n> ${excerpt.text}\n> — ${source.title}, ${trimmedLocator}\n`;
+      return `\n> ${excerpt.text}\n> — ${source.title}, ${excerpt.locator}\n`;
     }
   );
 
-  // 3. Resolver menciones simples: @clave (que no sea transclusión)
+  // 3. Resolver menciones simples con localizador opcional: @clave o @clave#p45
   resolved = resolved.replace(
-    /(?<!\!)@([A-Za-z0-9_\-]+)(?!#)/g,
-    (_match, citekey) => {
+    /(?<!\!)@([A-Za-z0-9_\-]+)(?:#([^\s;)]+))?/g,
+    (_match, citekey, locator) => {
       const source = db.getSourceByCitekey(citekey);
       if (!source) return `[${citekey}]`;
-      return style.cite(source);
+      return style.cite(source, locator?.trim());
     }
   );
 

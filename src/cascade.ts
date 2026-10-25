@@ -5,11 +5,12 @@
  * Al modificar el título de una nota o una clave BibTeX (citekey), el sistema
  * escanea y reemplaza automáticamente todas las instancias [[Nota Antigua]] o
  * @claveAntigua en el corpus de notas, manteniendo la trazabilidad de enlaces.
+ *
+ * Todas las operaciones usan la conexión principal y transacciones de
+ * better-sqlite3: no se abre una segunda conexión al mismo archivo.
  */
 
-import Database from "better-sqlite3";
 import { TesistaDB } from "./db.js";
-import type { Link } from "./types.js";
 
 /**
  * Resultado de una operación de cascada.
@@ -28,10 +29,6 @@ export interface CascadeResult {
 /**
  * Renombra el título de una nota y actualiza en cascada todos los wikilinks
  * [[ViejoTítulo]] y [[ViejoTítulo|Alias]] que apuntan a ella en el corpus.
- *
- * @param db - Instancia de la base de datos
- * @param noteId - ID de la nota a renombrar
- * @param newTitle - Nuevo título
  */
 export function renameNoteCascade(
   db: TesistaDB,
@@ -42,67 +39,60 @@ export function renameNoteCascade(
   if (!note) {
     throw new Error(`No existe la nota con id ${noteId}.`);
   }
-  const oldTitle = note.title;
-  if (oldTitle === newTitle) {
+  const cleanTitle = newTitle.trim();
+  if (!cleanTitle) {
+    throw new Error("El nuevo título no puede estar vacío.");
+  }
+  if (note.title === cleanTitle) {
     return { updatedNotes: 0, replacements: [] };
   }
 
+  const duplicate = db.getNoteByTitle(cleanTitle);
+  if (duplicate && duplicate.id !== noteId) {
+    throw new Error(`Ya existe otra nota titulada "${cleanTitle}".`);
+  }
+
+  const oldTitle = note.title;
   const allNotes = db.listNotes();
   const replacements: CascadeResult["replacements"] = [];
 
   // Patrones a buscar: [[OldTitle]] y [[OldTitle|Alias]]
   const exactRe = new RegExp(
     `\\[\\[${escapeRegExp(oldTitle)}(\\|[^\\]]*)?\\]\\]`,
-    "g"
+    "gi"
   );
 
-  const dbPath = db.getDbPath();
-  if (!dbPath) {
-    throw new Error("No se pudo determinar la ruta de la base de datos.");
-  }
-  const dbs = new Database(dbPath);
-  dbs.pragma("journal_mode = WAL");
-  dbs.pragma("foreign_keys = ON");
-  const now = new Date().toISOString();
+  const tx = db.getDb().transaction(() => {
+    // 1. Renombrar la nota (updateNote reconstruye sus propios enlaces)
+    db.updateNote(noteId, { title: cleanTitle });
 
-  try {
-    // 1. Renombrar la nota (SQL directo)
-    dbs.prepare(`UPDATE notes SET title = ?, updated_at = ? WHERE id = ?`).run(
-      newTitle,
-      now,
-      noteId
-    );
-
-    // 2. Reemplazar en todas las notas (incluida la propia si se referencia a sí misma)
-    const updateNoteStmt = dbs.prepare(
-      `UPDATE notes SET content = ?, updated_at = ? WHERE id = ?`
-    );
-
+    // 2. Reemplazar en todas las notas (incluida la propia si se autorreferencia)
     for (const targetNote of allNotes) {
       if (!targetNote.content || targetNote.id === undefined) continue;
+      const matches = targetNote.content.match(exactRe) ?? [];
+      if (matches.length === 0) continue;
+
       const newContent = targetNote.content.replace(exactRe, (match) => {
         const aliasMatch = match.match(/\|([^\]]+)\]\]$/);
         if (aliasMatch) {
-          return `[[${newTitle}|${aliasMatch[1]}]]`;
+          return `[[${cleanTitle}|${aliasMatch[1]}]]`;
         }
-        return `[[${newTitle}]]`;
+        return `[[${cleanTitle}]]`;
       });
 
       if (newContent !== targetNote.content) {
-        const count = (targetNote.content.match(exactRe) ?? []).length;
+        db.updateNote(targetNote.id, { content: newContent });
         replacements.push({
           noteId: targetNote.id,
-          noteTitle: targetNote.title,
+          noteTitle: targetNote.id === noteId ? cleanTitle : targetNote.title,
           oldText: targetNote.content,
           newText: newContent,
-          replacementsCount: count,
+          replacementsCount: matches.length,
         });
-        updateNoteStmt.run(newContent, now, targetNote.id);
       }
     }
-  } finally {
-    dbs.close();
-  }
+  });
+  tx();
 
   return {
     updatedNotes: replacements.length,
@@ -114,10 +104,6 @@ export function renameNoteCascade(
  * Renombra una clave BibTeX (citekey) de una fuente y actualiza en cascada
  * todas las menciones @ViejoClave y transclusiones !@ViejoClave#locator en
  * el corpus de notas.
- *
- * @param db - Instancia de la base de datos
- * @param sourceId - ID de la fuente cuya citekey cambia
- * @param newCitekey - Nueva citekey
  */
 export function renameCitekeyCascade(
   db: TesistaDB,
@@ -129,16 +115,20 @@ export function renameCitekeyCascade(
     throw new Error(`No existe la fuente con id ${sourceId}.`);
   }
   const oldCitekey = source.citekey;
-  if (oldCitekey === newCitekey) {
+  const cleanCitekey = newCitekey.trim();
+  if (!cleanCitekey) {
+    throw new Error("La nueva citekey no puede estar vacía.");
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(cleanCitekey)) {
+    throw new Error("La citekey solo puede contener letras, números, guiones y guiones bajos.");
+  }
+  if (oldCitekey === cleanCitekey) {
     return { updatedNotes: 0, replacements: [] };
   }
 
-  // Verificar que la nueva citekey no exista ya (en otra fuente)
-  const existing = db.listCitekeys().filter((k) => k !== oldCitekey);
-  if (existing.includes(newCitekey)) {
-    throw new Error(
-      `La citekey "${newCitekey}" ya está en uso por otra fuente.`
-    );
+  const duplicate = db.getSourceByCitekey(cleanCitekey);
+  if (duplicate && duplicate.id !== sourceId) {
+    throw new Error(`La citekey "${cleanCitekey}" ya está en uso por otra fuente.`);
   }
 
   const allNotes = db.listNotes();
@@ -150,75 +140,52 @@ export function renameCitekeyCascade(
     "g"
   );
 
-  const dbPath = db.getDbPath();
-  if (!dbPath) {
-    throw new Error("No se pudo determinar la ruta de la base de datos.");
-  }
-  const dbs = new Database(dbPath);
-  dbs.pragma("journal_mode = WAL");
-  dbs.pragma("foreign_keys = ON");
-  const now = new Date().toISOString();
+  const tx = db.getDb().transaction(() => {
+    // 1. Renombrar la citekey en la tabla sources
+    db.updateSource(sourceId, { citekey: cleanCitekey });
 
-  try {
-    // 1. Renombrar la citekey en la tabla sources (SQL directo)
-    dbs.prepare(
-      `UPDATE sources SET citekey = ?, date_modified = ? WHERE id = ?`
-    ).run(newCitekey, now, sourceId);
-
-    // 2. Reemplazar en todas las notas
-    const updateNoteStmt = dbs.prepare(
-      `UPDATE notes SET content = ?, updated_at = ? WHERE id = ?`
-    );
-
+    // 2. Reemplazar en todas las notas (updateNote reconstruye los links)
     for (const targetNote of allNotes) {
       if (!targetNote.content || targetNote.id === undefined) continue;
+      const matches = targetNote.content.match(mentionRe) ?? [];
+      if (matches.length === 0) continue;
+
       const newContent = targetNote.content.replace(mentionRe, (match: string) => {
         const bang = match.startsWith("!") ? "!" : "";
         const locatorMatch = match.match(/#([^\s\]]+)$/);
         if (locatorMatch) {
-          return `${bang}@${newCitekey}#${locatorMatch[1]}`;
+          return `${bang}@${cleanCitekey}#${locatorMatch[1]}`;
         }
-        return `${bang}@${newCitekey}`;
+        return `${bang}@${cleanCitekey}`;
       });
 
       if (newContent !== targetNote.content) {
-        const count = (targetNote.content.match(mentionRe) ?? []).length;
+        db.updateNote(targetNote.id, { content: newContent });
         replacements.push({
           noteId: targetNote.id,
           noteTitle: targetNote.title,
           oldText: targetNote.content,
           newText: newContent,
-          replacementsCount: count,
+          replacementsCount: matches.length,
         });
-        updateNoteStmt.run(newContent, now, targetNote.id);
       }
     }
 
-    // 3. Actualizar raw_text de los links cite_mention/transclusion
-    const links = dbs.prepare("SELECT * FROM links").all() as Link[];
-    const updateLinkStmt = dbs.prepare(
-      `UPDATE links SET raw_text = ? WHERE id = ?`
-    );
-
+    // 3. Actualizar raw_text de links que apuntaban a la fuente (defensa extra
+    //    para notas que no cambiaron de contenido).
+    const links = db.getDb()
+      .prepare("SELECT * FROM links WHERE target_source_id = ?")
+      .all(sourceId) as Array<{ id: number; raw_text: string }>;
+    const updateLink = db.getDb().prepare("UPDATE links SET raw_text = ? WHERE id = ?");
     for (const link of links) {
-      if (link.id === undefined || link.sourceNoteId === undefined) continue;
-      if (
-        (link.linkType === "cite_mention" ||
-          link.linkType === "transclusion") &&
-        link.targetSourceId === sourceId
-      ) {
-        const newRaw = link.rawText.replace(
-          new RegExp(`(!?)@${escapeRegExp(oldCitekey)}`),
-          `$1@${newCitekey}`
-        );
-        if (newRaw !== link.rawText) {
-          updateLinkStmt.run(newRaw, link.id);
-        }
-      }
+      const newRaw = link.raw_text.replace(
+        new RegExp(`(!?)@${escapeRegExp(oldCitekey)}`),
+        `$1@${cleanCitekey}`
+      );
+      if (newRaw !== link.raw_text) updateLink.run(newRaw, link.id);
     }
-  } finally {
-    dbs.close();
-  }
+  });
+  tx();
 
   return {
     updatedNotes: replacements.length,
@@ -226,9 +193,7 @@ export function renameCitekeyCascade(
   };
 }
 
-/**
- * Escapa caracteres especiales de una expresión regular.
- */
+/** Escapa caracteres especiales de una expresión regular. */
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

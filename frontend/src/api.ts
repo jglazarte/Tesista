@@ -9,6 +9,16 @@ const api: AxiosInstance = axios.create({
   },
 });
 
+/** Extrae un mensaje legible de un error de axios o de red. */
+export function errorMessage(err: any, fallback = "Ocurrió un error inesperado."): string {
+  return (
+    err?.response?.data?.error ||
+    err?.response?.data?.message ||
+    err?.message ||
+    fallback
+  );
+}
+
 // ===================== Sources =====================
 export interface Source {
   id?: number;
@@ -25,6 +35,7 @@ export interface Source {
   notes?: string;
   dateAdded?: string;
   dateModified?: string;
+  tags?: string[];
 }
 
 export interface NewSource {
@@ -37,6 +48,13 @@ export interface NewSource {
   containerTitle?: string;
   bibtexType?: string;
   readStatus?: string;
+  notes?: string;
+  citekey?: string;
+}
+
+export interface DoiImportResult {
+  source: Source;
+  existing: boolean;
 }
 
 export const sourcesApi = {
@@ -48,6 +66,8 @@ export const sourcesApi = {
   update: (id: number, data: Partial<NewSource>) =>
     api.put<Source>(`/sources/${id}`, data).then((r) => r.data),
   delete: (id: number) => api.delete(`/sources/${id}`).then((r) => r.data),
+  importDoi: (doi: string) =>
+    api.post<DoiImportResult>("/sources/import-doi", { doi }).then((r) => r.data),
 };
 
 // ===================== Excerpts =====================
@@ -87,6 +107,7 @@ export interface Note {
   id?: number;
   title: string;
   content: string;
+  tags: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -94,6 +115,7 @@ export interface Note {
 export interface NewNote {
   title: string;
   content: string;
+  tags?: string[];
 }
 
 export const notesApi = {
@@ -103,7 +125,8 @@ export const notesApi = {
   update: (id: number, data: Partial<NewNote>) =>
     api.put<Note>(`/notes/${id}`, data).then((r) => r.data),
   delete: (id: number) => api.delete(`/notes/${id}`).then((r) => r.data),
-  search: (q: string) => api.get<Note[]>(`/notes/search?q=${q}`).then((r) => r.data),
+  search: (q: string) =>
+    api.get<Note[]>("/notes/search", { params: { q } }).then((r) => r.data),
   outgoing: (id: number) =>
     api.get<any[]>(`/notes/${id}/outgoing`).then((r) => r.data),
   backlinks: (id: number) =>
@@ -117,27 +140,58 @@ export const notesApi = {
 };
 
 // ===================== Tags =====================
+export type TagType = "concept" | "methodology" | "stance" | "custom";
+export type ItemType = "source" | "excerpt" | "note";
+
 export interface Tag {
   id?: number;
   name: string;
-  type: "concept" | "methodology" | "stance" | "custom";
+  type: TagType;
   color?: string;
   icon?: string;
+  createdAt?: string;
 }
 
 export interface NewTag {
   name: string;
-  type: string;
+  type?: TagType;
   color?: string;
   icon?: string;
 }
 
 export const tagsApi = {
-  list: (type?: string) =>
+  list: (type?: TagType) =>
     api
       .get<Tag[]>("/tags", { params: type ? { type } : {} })
       .then((r) => r.data),
-  create: (data: NewTag) => api.post<Tag>("/tags", data).then((r) => r.data),
+  create: (name: string, type: TagType = "custom") =>
+    api.post<Tag>("/tags", { name, type }).then((r) => r.data),
+  update: (id: number, data: Partial<NewTag>) =>
+    api.put<Tag>(`/tags/${id}`, data).then((r) => r.data),
+  delete: (id: number) => api.delete(`/tags/${id}`).then((r) => r.data),
+};
+
+export const itemTagsApi = {
+  list: (itemType: ItemType, itemId: number) =>
+    api.get<Tag[]>(`/items/${itemType}/${itemId}/tags`).then((r) => r.data),
+  set: (itemType: ItemType, itemId: number, tags: string[]) =>
+    api
+      .put<Tag[]>(`/items/${itemType}/${itemId}/tags`, { tags })
+      .then((r) => r.data),
+};
+
+// ===================== Stats =====================
+export interface Stats {
+  sources: number;
+  excerpts: number;
+  notes: number;
+  sections: number;
+  tags: number;
+  links: number;
+}
+
+export const statsApi = {
+  get: () => api.get<Stats>("/stats").then((r) => r.data),
 };
 
 // ===================== Sections =====================
@@ -147,37 +201,42 @@ export interface Section {
   id?: number;
   title: string;
   type: SectionType;
-  parentId?: number;
+  parentId?: number | null;
   position?: number;
   ownContent?: string;
-  wordGoal?: number;
-  children?: Section[];
-  evidenceCount?: number;
-  ownWordCount?: number;
-  evidenceWordCount?: number;
-  totalWordCount?: number;
+  wordGoal?: number | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SectionTreeNode extends Section {
+  children: SectionTreeNode[];
+  evidenceCount: number;
+  ownWordCount: number;
+  evidenceWordCount: number;
+  totalWordCount: number;
   progressPct?: number;
 }
 
 export interface NewSection {
   title: string;
   type: SectionType;
-  parentId?: number;
+  parentId?: number | null;
   position?: number;
   ownContent?: string;
-  wordGoal?: number;
+  wordGoal?: number | null;
 }
 
 export const sectionsApi = {
   list: () => api.get<Section[]>("/sections").then((r) => r.data),
-  tree: () => api.get<Section[]>("/sections/tree").then((r) => r.data),
+  tree: () => api.get<SectionTreeNode[]>("/sections/tree").then((r) => r.data),
   create: (data: NewSection) =>
     api.post<Section>("/sections", data).then((r) => r.data),
   get: (id: number) => api.get<Section>(`/sections/${id}`).then((r) => r.data),
   update: (id: number, data: Partial<NewSection>) =>
     api.put<Section>(`/sections/${id}`, data).then((r) => r.data),
   delete: (id: number) => api.delete(`/sections/${id}`).then((r) => r.data),
-  reorder: (id: number, parentId?: number, position?: number) =>
+  reorder: (id: number, parentId?: number | null, position?: number) =>
     api
       .post(`/sections/${id}/reorder`, { parentId, position })
       .then((r) => r.data),
@@ -248,28 +307,30 @@ export const gapReportApi = {
 };
 
 // ===================== Matrix =====================
+export interface MatrixItem {
+  type: "excerpt" | "note";
+  id: number;
+  text: string;
+  locator?: string;
+  noteTitle?: string;
+}
+
+export interface MatrixCell {
+  rowId: number;
+  columnTagId: number;
+  items: MatrixItem[];
+  itemCount: number;
+}
+
 export interface MatrixQueryResult {
   rows: Array<{ id: number; title: string; citekey?: string }>;
   columns: Tag[];
-  cells: Array<{
-    rowId: number;
-    columnTagId: number;
-    items: Array<{
-      type: "excerpt" | "note";
-      id: number;
-      text: string;
-      locator?: string;
-      noteTitle?: string;
-    }>;
-    itemCount: number;
-  }>;
+  cells: MatrixCell[];
 }
 
 export const matrixApi = {
-  build: (options?: { filter?: any; tagType?: string; rowLimit?: number }) =>
-    api
-      .post<MatrixQueryResult>("/matrix", options)
-      .then((r) => r.data),
+  build: (options?: { filter?: any; tagType?: TagType; rowLimit?: number }) =>
+    api.post<MatrixQueryResult>("/matrix", options).then((r) => r.data),
 };
 
 // ===================== Integrity =====================
@@ -295,23 +356,85 @@ export const integrityApi = {
 };
 
 // ===================== Backup =====================
+export interface BackupResult {
+  outputPath: string;
+  sizeBytes: number;
+  includedFiles: string[];
+  createdAt: string;
+}
+
 export const backupApi = {
-  create: (outputPath: string) =>
+  create: (outputPath?: string) =>
     api
-      .post<{ outputPath: string; sizeBytes: number }>("/backup", {
-        outputPath,
-      })
+      .post<BackupResult>("/backup", outputPath ? { outputPath } : {})
       .then((r) => r.data),
 };
 
 // ===================== Export =====================
+export interface ExportMetadata {
+  title: string;
+  author: string;
+  date?: string;
+  abstract?: string;
+  bibliographyPath?: string;
+  language?: string;
+  keywords?: string[];
+}
+
 export const exportApi = {
   chapter: (
     sectionId: number,
-    metadata: { title: string; author: string; date?: string; abstract?: string },
-    options?: { styleId?: string; includeBibliography?: boolean; bibliographyPath?: string }
+    metadata: ExportMetadata,
+    options?: {
+      styleId?: string;
+      includeBibliography?: boolean;
+      bibliographyPath?: string;
+      save?: boolean;
+      outputDir?: string;
+      format?: "markdown" | "latex" | "pdf" | "docx" | "typst";
+    }
   ) =>
     api.post("/export/chapter", { sectionId, metadata, ...options }).then((r) => r.data),
+};
+
+// ===================== Git =====================
+export interface GitStatus {
+  available: boolean;
+  initialized: boolean;
+  clean: boolean;
+  changedFiles: string[];
+}
+
+export interface GitLogEntry {
+  hash: string;
+  author: string;
+  date: string;
+  message: string;
+}
+
+export interface GitCommitResult {
+  success: boolean;
+  message?: string;
+  hash?: string;
+  error?: string;
+}
+
+export const gitApi = {
+  status: () => api.get<GitStatus>("/git/status").then((r) => r.data),
+  log: (limit = 20) =>
+    api.get<GitLogEntry[]>("/git/log", { params: { limit } }).then((r) => r.data),
+  diff: (params?: { from?: string; to?: string; file?: string }) =>
+    api
+      .get<{ diff: string }>("/git/diff", { params })
+      .then((r) => r.data),
+  commit: (message: string) =>
+    api.post<GitCommitResult>("/git/commit", { message }).then((r) => r.data),
+  init: () => api.post("/git/init").then((r) => r.data),
+};
+
+// ===================== Mantenimiento =====================
+export const maintenanceApi = {
+  vacuum: () => api.post("/maintenance/vacuum").then((r) => r.data),
 };
 
 export default api;

@@ -15,7 +15,7 @@
  */
 
 import { TesistaDB } from "./db.js";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -61,6 +61,7 @@ export function createBackup(
       { name: "notes", data: db.listNotes() },
       { name: "sections", data: db.listSections() },
       { name: "tags", data: db.listTags() },
+      { name: "item_tags", data: db.listItemTags() },
       { name: "section_evidences", data: getSectionEvidencesAll(db) },
       { name: "saved_views", data: db.listSavedViews() },
       { name: "links", data: db.getAllLinks() },
@@ -109,8 +110,10 @@ export function createBackup(
     }
 
     const tarFile = path.resolve(outputPath);
-    const tarCmd = `tar -czf "${tarFile}" -C "${tmpDir}" .`;
-    execSync(tarCmd, { stdio: "pipe", encoding: "utf-8" });
+    execFileSync("tar", ["-czf", tarFile, "-C", tmpDir, "."], {
+      stdio: "pipe",
+      encoding: "utf-8",
+    });
 
     const stat = fsModule.statSync(tarFile);
 
@@ -166,7 +169,11 @@ function slugFileName(title: string): string {
  */
 export function isBackupAvailable(): boolean {
   try {
-    execSync("tar --version", { stdio: "pipe", encoding: "utf-8", timeout: 5000 });
+    execFileSync("tar", ["--version"], {
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 5000,
+    });
     return true;
   } catch {
     return false;
@@ -177,7 +184,7 @@ export function isBackupAvailable(): boolean {
  * Lista el contenido de un archivo de respaldo .tar.gz sin extraerlo.
  */
 export function listBackupContents(backupPath: string): string[] {
-  const output = execSync(`tar -tzf "${backupPath}"`, {
+  const output = execFileSync("tar", ["-tzf", backupPath], {
     stdio: "pipe",
     encoding: "utf-8",
   });
@@ -195,7 +202,7 @@ export function extractBackup(backupPath: string, destDir: string): void {
   if (!fsModule.existsSync(destDir)) {
     fsModule.mkdirSync(destDir, { recursive: true });
   }
-  execSync(`tar -xzf "${backupPath}" -C "${destDir}"`, {
+  execFileSync("tar", ["-xzf", backupPath, "-C", destDir], {
     stdio: "pipe",
     encoding: "utf-8",
   });

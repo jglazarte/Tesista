@@ -12,18 +12,35 @@ import { renameCitekeyCascade } from "../../src/cascade.js";
 import { searchFullText } from "../../src/fts.js";
 import { getIntegrityReport } from "../../src/integrity.js";
 import { createBackup, isBackupAvailable } from "../../src/backup.js";
-import { exportChapter } from "../../src/export.js";
+import { exportChapter, saveAndConvert } from "../../src/export.js";
+import { resolveSourceFromCrossRef } from "../../src/crossref.js";
+import { fetchOpenAlexByDoi } from "../../src/openalex.js";
+import {
+  isGitAvailable,
+  gitStatus,
+  gitLog,
+  gitCommit,
+  gitDiff,
+  ensureGitRepo,
+  ensureGitUser,
+} from "../../src/git.js";
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || "127.0.0.1";
 
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-// Instancia de la base de datos (usar ruta absoluta para evitar problemas)
-const dbPath = path.resolve(process.cwd(), "../data/tesista.db");
+// Instancia de la base de datos. TESISTA_DB permite fijar una ruta explícita.
+const dbPath = process.env.TESISTA_DB
+  ? path.resolve(process.env.TESISTA_DB)
+  : path.resolve(process.cwd(), "../data/tesista.db");
 const db = new TesistaDB(dbPath);
+
+// Directorio raíz del proyecto (para Git y respaldos)
+const projectRoot = path.resolve(process.cwd(), "..");
 
 // Middleware de logging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -31,11 +48,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Middleware de manejo de errores
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-  console.error("Error:", err.message);
-  res.status(500).json({ error: err.message || "Error interno del servidor" });
-});
+/** Convierte un parámetro de ruta en entero positivo; responde 400 si es inválido. */
+function parseId(value: string, res: Response): number | null {
+  const id = Number.parseInt(value, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    res.status(400).json({ error: `Identificador inválido: "${value}".` });
+    return null;
+  }
+  return id;
+}
 
 // ===================== SOURCES =====================
 
@@ -196,10 +217,11 @@ app.get("/api/notes", (_req: Request, res: Response) => {
   }
 });
 
-// Obtener una nota por ID
-app.get("/api/notes/:id", (req: Request, res: Response) => {
+// Obtener una nota por ID (solo numérico, para no tapar /search y /transclude)
+app.get("/api/notes/:id(\\d+)", (req: Request, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseId(req.params.id, res);
+    if (id === null) return;
     const note = db.getNote(id);
     if (!note) {
       return res.status(404).json({ error: "Nota no encontrada" });
@@ -326,17 +348,47 @@ app.get("/api/tags", (req: Request, res: Response) => {
   }
 });
 
-// Crear etiqueta
+// Crear (o recuperar, si ya existe por nombre) una etiqueta
 app.post("/api/tags", (req: Request, res: Response) => {
   try {
-    const tag = db.createTag(req.body);
+    const { name, type } = req.body ?? {};
+    if (typeof name !== "string" || name.trim().length === 0) {
+      return res.status(400).json({ error: "El nombre de la etiqueta es obligatorio." });
+    }
+    const tag = db.ensureTag(name, type);
     res.status(201).json(tag);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Vincular etiqueta a ítem
+// Actualizar una etiqueta
+app.put("/api/tags/:id", (req: Request, res: Response) => {
+  try {
+    const id = parseId(req.params.id, res);
+    if (id === null) return;
+    const tag = db.updateTag(id, req.body);
+    if (!tag) return res.status(404).json({ error: "Etiqueta no encontrada" });
+    res.json(tag);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Eliminar una etiqueta (y sus vínculos)
+app.delete("/api/tags/:id", (req: Request, res: Response) => {
+  try {
+    const id = parseId(req.params.id, res);
+    if (id === null) return;
+    const deleted = db.deleteTag(id);
+    if (!deleted) return res.status(404).json({ error: "Etiqueta no encontrada" });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Vincular etiqueta a ítem mediante tagId
 app.post("/api/item-tags", (req: Request, res: Response) => {
   try {
     const link = db.addTagToItem(req.body);
@@ -346,14 +398,48 @@ app.post("/api/item-tags", (req: Request, res: Response) => {
   }
 });
 
+// Quitar un vínculo ítem-etiqueta por su id
+app.delete("/api/item-tags/:id", (req: Request, res: Response) => {
+  try {
+    const id = parseId(req.params.id, res);
+    if (id === null) return;
+    const link = db.getItemTag(id);
+    if (!link) return res.status(404).json({ error: "Vínculo no encontrado" });
+    const removed = db.removeTagFromItem(link.itemType, link.itemId, link.tagId);
+    if (!removed) return res.status(404).json({ error: "Vínculo no encontrado" });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Obtener etiquetas de un ítem
 app.get("/api/items/:itemType/:itemId/tags", (req: Request, res: Response) => {
   try {
-    const { itemType, itemId } = req.params;
-    const tags = db.getTagsForItem(itemType as any, parseInt(itemId, 10));
+    const { itemType } = req.params;
+    const itemId = parseId(req.params.itemId, res);
+    if (itemId === null) return;
+    const tags = db.getTagsForItem(itemType as any, itemId);
     res.json(tags);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Reemplazar el conjunto completo de etiquetas de un ítem (por nombre)
+app.put("/api/items/:itemType/:itemId/tags", (req: Request, res: Response) => {
+  try {
+    const { itemType } = req.params;
+    const itemId = parseId(req.params.itemId, res);
+    if (itemId === null) return;
+    const names = req.body?.tags;
+    if (!Array.isArray(names) || names.some((n) => typeof n !== "string")) {
+      return res.status(400).json({ error: "Se esperaba { tags: string[] }." });
+    }
+    const tags = db.setTagsForItem(itemType as any, itemId, names);
+    res.json(tags);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -583,14 +669,30 @@ app.get("/api/integrity", (_req: Request, res: Response) => {
   }
 });
 
+// ===================== ESTADÍSTICAS =====================
+
+app.get("/api/stats", (_req: Request, res: Response) => {
+  try {
+    res.json(db.getStats());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===================== RESPALDOS =====================
 
 app.post("/api/backup", (req: Request, res: Response) => {
   try {
-    const { outputPath } = req.body;
     if (!isBackupAvailable()) {
       return res.status(500).json({ error: "Backup no disponible (falta tar)" });
     }
+    // Ruta por defecto: backups/tesista-<fecha>.tar.gz dentro del proyecto.
+    const requested = req.body?.outputPath;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const outputPath =
+      typeof requested === "string" && requested.trim().length > 0
+        ? path.resolve(requested)
+        : path.join(projectRoot, "backups", `tesista-${stamp}.tar.gz`);
     const result = createBackup(db, outputPath);
     res.json(result);
   } catch (err: any) {
@@ -600,25 +702,205 @@ app.post("/api/backup", (req: Request, res: Response) => {
 
 // ===================== EXPORTACIÓN =====================
 
-app.post("/api/export/chapter", (req: Request, res: Response) => {
+app.post("/api/export/chapter", async (req: Request, res: Response) => {
   try {
-    const { sectionId, metadata, styleId, includeBibliography, bibliographyPath } = req.body;
-    const result = exportChapter(db, sectionId, {
+    const {
+      sectionId,
+      metadata,
+      styleId,
+      includeBibliography,
+      bibliographyPath,
+      save = false,
+      outputDir,
+      format = "markdown",
+    } = req.body ?? {};
+
+    const id = Number.parseInt(String(sectionId), 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ error: "sectionId inválido." });
+    }
+
+    const result = exportChapter(db, id, {
       metadata,
       styleId,
       includeBibliography,
       bibliographyPath,
     });
+
+    let outputPath: string | undefined;
+    if (save) {
+      const dir =
+        typeof outputDir === "string" && outputDir.trim().length > 0
+          ? path.resolve(outputDir)
+          : path.join(projectRoot, "export");
+      outputPath = await saveAndConvert(result, dir, format);
+    }
+
+    res.json({ ...result, outputPath: outputPath ?? result.outputPath });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================== GIT =====================
+
+app.get("/api/git/status", (_req: Request, res: Response) => {
+  try {
+    res.json({
+      available: isGitAvailable(),
+      ...gitStatus(projectRoot),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/git/log", (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(
+      Math.max(Number.parseInt(String(req.query.limit ?? "20"), 10) || 20, 1),
+      200
+    );
+    res.json(gitLog(projectRoot, limit));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/git/diff", (req: Request, res: Response) => {
+  try {
+    const from = req.query.from as string | undefined;
+    const to = req.query.to as string | undefined;
+    const file = req.query.file as string | undefined;
+    res.json({ diff: gitDiff(projectRoot, { from, to, file }) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/git/commit", (req: Request, res: Response) => {
+  try {
+    const message =
+      typeof req.body?.message === "string" && req.body.message.trim().length > 0
+        ? req.body.message.trim()
+        : `Tesista: instantánea ${new Date().toISOString()}`;
+    ensureGitUser(projectRoot);
+    const result = gitCommit(projectRoot, message);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`Tesista Server escuchando en http://localhost:${PORT}`);
-  console.log(`Base de datos: ${dbPath}`);
+app.post("/api/git/init", (_req: Request, res: Response) => {
+  try {
+    if (!isGitAvailable()) {
+      return res.status(500).json({ error: "Git no está instalado en el sistema." });
+    }
+    ensureGitRepo(projectRoot);
+    res.json({ success: true, ...gitStatus(projectRoot) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
+
+// ===================== IMPORTACIÓN POR DOI =====================
+
+app.post("/api/sources/import-doi", async (req: Request, res: Response) => {
+  try {
+    const raw = req.body?.doi;
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+      return res.status(400).json({ error: "Se requiere un DOI." });
+    }
+    const doi = raw
+      .trim()
+      .replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
+      .replace(/^doi:\s*/i, "")
+      .trim();
+
+    // Si ya existe una fuente con ese DOI, no se duplica.
+    const existing = db.getSourceByDoi(doi);
+    if (existing) {
+      return res.status(200).json({ source: existing, existing: true });
+    }
+
+    // 1) CrossRef; 2) OpenAlex como respaldo.
+    let partial = await resolveSourceFromCrossRef(doi);
+    if (!partial || !partial.title) {
+      partial = (await fetchOpenAlexByDoi(doi)) as typeof partial;
+    }
+    if (!partial || !partial.title) {
+      return res.status(404).json({
+        error: "No se encontraron metadatos para ese DOI. Podés cargar la fuente manualmente.",
+      });
+    }
+
+    const source = db.createSource({
+      title: partial.title,
+      authors: partial.authors ?? [],
+      year: partial.year,
+      doi,
+      isbn: partial.isbn,
+      publisher: partial.publisher,
+      containerTitle: partial.containerTitle,
+      bibtexType: partial.bibtexType ?? "article",
+      readStatus: "unread",
+      notes: partial.notes,
+    });
+    res.status(201).json({ source, existing: false });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================== MANTENIMIENTO =====================
+
+app.post("/api/maintenance/vacuum", (_req: Request, res: Response) => {
+  try {
+    db.vacuum();
+    res.json({ success: true, ...db.getStats() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===================== 404 Y MANEJO DE ERRORES =====================
+
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: "Ruta no encontrada" });
+});
+
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("Error:", err?.message ?? err);
+  const status = typeof err?.status === "number" ? err.status : 500;
+  res.status(status).json({ error: err?.message || "Error interno del servidor" });
+});
+
+// Iniciar servidor
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Tesista Server escuchando en http://${HOST}:${PORT}`);
+  console.log(`Base de datos: ${dbPath}`);
+  console.log(`Raíz del proyecto: ${projectRoot}`);
+});
+
+function shutdown(signal: string): void {
+  console.log(`\n${signal} recibido: cerrando servidor...`);
+  server.close(() => {
+    try {
+      db.close();
+    } catch (err: any) {
+      console.error("Error al cerrar la base de datos:", err?.message ?? err);
+    }
+    process.exit(0);
+  });
+  // Si el cierre ordenado tarda demasiado, forzar salida.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 export { app };

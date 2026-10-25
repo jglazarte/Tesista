@@ -12,20 +12,25 @@
  * para que la capa de aplicación persista la tabla Links y construya el grafo.
  */
 
-import type { LinkRef, LinkType } from "./types.js";
+import type { LinkRef } from "./types.js";
 
 /**
  * Expresión regular combinada que captura los tres tipos de referencia en un
  * solo pase sobre el contenido.
  *
+ * Para transclusiones (!@cite#loc) el localizador admite espacios y termina en
+ * salto de línea o en `]`. Para menciones simples (@cite) el localizador, si
+ * existe, termina en el primer espacio.
+ *
  * Grupos:
- *   1 -> '!' si es transclusión (undefined si no)
- *   2 -> citekey (para @ / !@)
- *   3 -> locator tras '#' (solo transclusión)
- *   4 -> contenido de [[...]] (wikilink)
+ *   1 -> citekey de transclusión
+ *   2 -> locator de transclusión (puede contener espacios)
+ *   3 -> citekey de mención
+ *   4 -> locator de mención
+ *   5 -> contenido de [[...]] (wikilink)
  */
 const LINK_RE =
-  /(!?)\@([A-Za-z0-9_\-]+)(?:#([^\s\]]+))?|\[\[([^\]]+)\]\]/g;
+  /!@([A-Za-z0-9_-]+)(?:#([^\n\]]+))?|@([A-Za-z0-9_-]+)(?:#([^\s\]]+))?|\[\[([^\]]+)\]\]/g;
 
 /**
  * Extrae todas las referencias de un contenido Markdown.
@@ -36,7 +41,7 @@ export function extractLinks(content: string): LinkRef[] {
   const seen = new Set<string>(); // evita duplicados idénticos en la misma nota
 
   for (const match of content.matchAll(LINK_RE)) {
-    const [raw, bang, citekey, locator, wiki] = match;
+    const [raw, transKey, transLoc, citeKey, citeLoc, wiki] = match;
     const index = match.index ?? 0;
 
     if (wiki !== undefined) {
@@ -53,14 +58,28 @@ export function extractLinks(content: string): LinkRef[] {
       continue;
     }
 
-    if (citekey) {
-      const key = `${bang ? "transclusion" : "cite_mention"}|${citekey}|${locator ?? ""}|${index}`;
+    if (transKey) {
+      const locator = transLoc?.trim();
+      const key = `transclusion|${transKey}|${locator ?? ""}|${index}`;
       if (seen.has(key)) continue;
       seen.add(key);
       refs.push({
-        type: (bang ? "transclusion" : "cite_mention") as LinkType,
-        target: citekey,
-        locator: locator ?? undefined,
+        type: "transclusion",
+        target: transKey,
+        locator: locator || undefined,
+        raw,
+      });
+      continue;
+    }
+
+    if (citeKey) {
+      const key = `cite_mention|${citeKey}|${citeLoc ?? ""}|${index}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push({
+        type: "cite_mention",
+        target: citeKey,
+        locator: citeLoc || undefined,
         raw,
       });
     }

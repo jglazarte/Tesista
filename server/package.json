@@ -2,11 +2,12 @@
   "name": "tesista-server",
   "version": "1.0.0",
   "description": "API REST para Tesista - Plataforma de gestión de conocimiento para tesis doctorales",
-  "main": "dist/index.js",
+  "main": "dist/server/src/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/server/src/index.js",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",

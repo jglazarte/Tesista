@@ -54,6 +54,24 @@ import type {
 
 const DEFAULT_DB_PATH = path.join(process.cwd(), "data", "tesista.db");
 
+/**
+ * Campos permitidos en filtros declarativos. Evita que un nombre de campo
+ * arbitrario llegue al SQL (los valores sí van parametrizados).
+ */
+const ALLOWED_FILTER_FIELDS = new Set([
+  "sources.id", "sources.title", "sources.year", "sources.doi",
+  "sources.isbn", "sources.publisher", "sources.container_title",
+  "sources.bibtex_type", "sources.citekey", "sources.read_status",
+  "sources.notes", "sources.date_added", "sources.date_modified",
+  "excerpts.id", "excerpts.source_id", "excerpts.text", "excerpts.locator",
+  "excerpts.context", "excerpts.date_added",
+  "notes.id", "notes.title", "notes.content", "notes.created_at",
+  "notes.updated_at",
+  "sections.id", "sections.title", "sections.type", "sections.parent_id",
+  "sections.position", "sections.word_goal",
+  "tags.id", "tags.name", "tags.type", "tags.color",
+]);
+
 export class TesistaDB {
   private db: Database.Database;
 
@@ -201,7 +219,50 @@ export class TesistaDB {
 
       CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id, position);
       CREATE INDEX IF NOT EXISTS idx_section_evidences_section ON section_evidences(section_id, position);
+      CREATE INDEX IF NOT EXISTS idx_section_evidences_target ON section_evidences(evidence_type, evidence_id);
+      CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC);
     `);
+
+    // Unicidad de etiquetas por nombre (sin distinguir mayúsculas). Si ya existen
+    // duplicados de versiones anteriores, se conserva el primero y se recrea el índice.
+    try {
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_nocase ON tags(name COLLATE NOCASE)"
+      );
+    } catch {
+      this.db.exec(
+        `DELETE FROM tags WHERE id NOT IN (
+           SELECT MIN(id) FROM tags GROUP BY name COLLATE NOCASE
+         )`
+      );
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_nocase ON tags(name COLLATE NOCASE)"
+      );
+    }
+  }
+
+  /* ===================== Utilidades de normalización ===================== */
+
+  /** Normaliza un DOI: quita prefijos de URL, espacios y unifica a minúsculas. */
+  private normalizeDoi(doi?: string | null): string | null {
+    if (doi === undefined || doi === null) return null;
+    const clean = doi
+      .trim()
+      .replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
+      .replace(/^doi:\s*/i, "")
+      .trim()
+      .toLowerCase();
+    return clean.length > 0 ? clean : null;
+  }
+
+  /** Normaliza localizadores para compararlos de forma tolerante (p. 45 == P.  45). */
+  normalizeLocator(locator?: string | null): string {
+    if (!locator) return "";
+    return locator
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[.;,]+$/, "");
   }
 
   /** Cierra la conexión a la base de datos. */
@@ -271,11 +332,13 @@ export class TesistaDB {
     return row ? this.rowToSource(row) : null;
   }
 
-  /** Busca una fuente por DOI. */
+  /** Busca una fuente por DOI (normalizado y sin distinguir mayúsculas). */
   getSourceByDoi(doi: string): Source | null {
+    const normalized = this.normalizeDoi(doi);
+    if (!normalized) return null;
     const row = this.db
-      .prepare("SELECT * FROM sources WHERE doi = ?")
-      .get(doi) as any | undefined;
+      .prepare("SELECT * FROM sources WHERE doi = ? COLLATE NOCASE")
+      .get(normalized) as any | undefined;
     return row ? this.rowToSource(row) : null;
   }
 
@@ -314,7 +377,7 @@ export class TesistaDB {
         input.title,
         JSON.stringify(input.authors),
         input.year ?? null,
-        input.doi ?? null,
+        this.normalizeDoi(input.doi),
         input.isbn ?? null,
         input.publisher ?? null,
         input.containerTitle ?? null,
@@ -340,20 +403,17 @@ export class TesistaDB {
     if (patch.title !== undefined) { fields.push("title = ?"); values.push(patch.title); }
     if (patch.authors !== undefined) { fields.push("authors_json = ?"); values.push(JSON.stringify(patch.authors)); }
     if (patch.year !== undefined) { fields.push("year = ?"); values.push(patch.year); }
-    if (patch.doi !== undefined) { fields.push("doi = ?"); values.push(patch.doi); }
+    if (patch.doi !== undefined) { fields.push("doi = ?"); values.push(this.normalizeDoi(patch.doi)); }
     if (patch.isbn !== undefined) { fields.push("isbn = ?"); values.push(patch.isbn); }
     if (patch.publisher !== undefined) { fields.push("publisher = ?"); values.push(patch.publisher); }
     if (patch.containerTitle !== undefined) { fields.push("container_title = ?"); values.push(patch.containerTitle); }
     if (patch.bibtexType !== undefined) { fields.push("bibtex_type = ?"); values.push(patch.bibtexType); }
     if (patch.citekey !== undefined) {
-      const existing = this.listCitekeys().filter((k) => k !== patch.citekey);
-      if (existing.includes(patch.citekey)) {
-        // Sugerir alternativa automática si hay colisión
-        const generated = generateCitekey(
-          { authors: (this.getSource(id)?.authors ?? []), year: patch.year ?? this.getSource(id)?.year },
-          existing
-        );
-        patch.citekey = generated.suggested;
+      const conflict = this.db
+        .prepare("SELECT id FROM sources WHERE citekey = ? AND id != ?")
+        .get(patch.citekey, id) as { id: number } | undefined;
+      if (conflict) {
+        throw new Error(`La citekey "${patch.citekey}" ya está en uso por otra fuente.`);
       }
       fields.push("citekey = ?");
       values.push(patch.citekey);
@@ -373,9 +433,38 @@ export class TesistaDB {
     return this.getSource(id);
   }
 
-  /** Elimina una fuente y sus citas asociadas (cascade). */
+  /** Elimina una fuente y sus citas, etiquetas y evidencias asociadas. */
   deleteSource(id: number): boolean {
-    const info = this.db.prepare("DELETE FROM sources WHERE id = ?").run(id);
+    const tx = this.db.transaction(() => {
+      const excerptIds = (
+        this.db
+          .prepare("SELECT id FROM excerpts WHERE source_id = ?")
+          .all(id) as Array<{ id: number }>
+      ).map((r) => r.id);
+
+      if (excerptIds.length > 0) {
+        const placeholders = excerptIds.map(() => "?").join(",");
+        this.db
+          .prepare(
+            `DELETE FROM item_tags
+              WHERE item_type = 'excerpt' AND item_id IN (${placeholders})`
+          )
+          .run(...excerptIds);
+        this.db
+          .prepare(
+            `DELETE FROM section_evidences
+              WHERE evidence_type = 'excerpt' AND evidence_id IN (${placeholders})`
+          )
+          .run(...excerptIds);
+      }
+
+      this.db
+        .prepare("DELETE FROM item_tags WHERE item_type = 'source' AND item_id = ?")
+        .run(id);
+
+      return this.db.prepare("DELETE FROM sources WHERE id = ?").run(id);
+    });
+    const info = tx();
     return (info.changes ?? 0) > 0;
   }
 
@@ -430,21 +519,29 @@ export class TesistaDB {
     }
 
     const now = new Date().toISOString();
-    const info = this.db
-      .prepare(
-        `INSERT INTO excerpts (source_id, text, locator, context, tags_json, date_added)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        input.sourceId,
-        input.text.trim(),
-        input.locator.trim(),
-        input.context ?? null,
-        JSON.stringify(input.tags ?? []),
-        now
-      );
+    const tx = this.db.transaction(() => {
+      const info = this.db
+        .prepare(
+          `INSERT INTO excerpts (source_id, text, locator, context, tags_json, date_added)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          input.sourceId,
+          input.text.trim(),
+          input.locator.trim(),
+          input.context ?? null,
+          JSON.stringify(input.tags ?? []),
+          now
+        );
 
-    const created = this.getExcerpt(info.lastInsertRowid as number);
+      const id = info.lastInsertRowid as number;
+      if (input.tags !== undefined) {
+        this.setTagsForItem("excerpt", id, input.tags);
+      }
+      return id;
+    });
+
+    const created = this.getExcerpt(tx());
     if (!created) throw new Error("No se pudo crear la cita");
     return created;
   }
@@ -484,19 +581,48 @@ export class TesistaDB {
     if (patch.context !== undefined) { fields.push("context = ?"); values.push(patch.context); }
     if (patch.tags !== undefined) { fields.push("tags_json = ?"); values.push(JSON.stringify(patch.tags)); }
 
-    if (fields.length === 0) return this.getExcerpt(id);
+    if (fields.length === 0 && patch.tags === undefined) return this.getExcerpt(id);
+    if (!this.getExcerpt(id)) return null;
 
-    this.db.prepare(
-      `UPDATE excerpts SET ${fields.join(", ")} WHERE id = ?`
-    ).run(...values, id);
+    const tx = this.db.transaction(() => {
+      if (fields.length > 0) {
+        this.db.prepare(
+          `UPDATE excerpts SET ${fields.join(", ")} WHERE id = ?`
+        ).run(...values, id);
+      }
+      if (patch.tags !== undefined) {
+        this.setTagsForItem("excerpt", id, patch.tags);
+      }
+    });
+    tx();
 
     return this.getExcerpt(id);
   }
 
-  /** Elimina una cita. */
+  /** Elimina una cita, sus etiquetas y sus vínculos como evidencia. */
   deleteExcerpt(id: number): boolean {
-    const info = this.db.prepare("DELETE FROM excerpts WHERE id = ?").run(id);
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM item_tags WHERE item_type = 'excerpt' AND item_id = ?")
+        .run(id);
+      this.db
+        .prepare(
+          "DELETE FROM section_evidences WHERE evidence_type = 'excerpt' AND evidence_id = ?"
+        )
+        .run(id);
+      return this.db.prepare("DELETE FROM excerpts WHERE id = ?").run(id);
+    });
+    const info = tx();
     return (info.changes ?? 0) > 0;
+  }
+
+  /** Busca la cita de una fuente por localizador (tolerante a espacios/mayúsculas). */
+  findExcerptByLocator(sourceId: number, locator: string): Excerpt | null {
+    const target = this.normalizeLocator(locator);
+    const excerpts = this.listExcerptsBySource(sourceId);
+    return (
+      excerpts.find((e) => this.normalizeLocator(e.locator) === target) ?? null
+    );
   }
 
   /* ===================== Notes ===================== */
@@ -506,57 +632,101 @@ export class TesistaDB {
       id: row.id,
       title: row.title,
       content: row.content,
+      tags: [],
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
   }
 
-  /** Crea una nota atómica y, si hay contenido, extrae y persiste sus enlaces. */
+  /** Adjunta las etiquetas (item_tags) a una lista de notas en una sola consulta. */
+  private attachTagsToNotes(notes: Note[]): Note[] {
+    if (notes.length === 0) return notes;
+    const ids = notes.map((n) => n.id!).filter((id) => id !== undefined);
+    if (ids.length === 0) return notes;
+
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT it.item_id, t.name
+           FROM item_tags it
+           JOIN tags t ON t.id = it.tag_id
+          WHERE it.item_type = 'note' AND it.item_id IN (${placeholders})
+          ORDER BY t.name COLLATE NOCASE`
+      )
+      .all(...ids) as Array<{ item_id: number; name: string }>;
+
+    const byNote = new Map<number, string[]>();
+    for (const row of rows) {
+      const list = byNote.get(row.item_id) ?? [];
+      list.push(row.name);
+      byNote.set(row.item_id, list);
+    }
+    return notes.map((n) => ({ ...n, tags: byNote.get(n.id!) ?? [] }));
+  }
+
+  /**
+   * Crea una nota atómica y, si hay contenido, extrae y persiste sus enlaces.
+   * Las etiquetas se guardan en item_tags y se crean si no existen.
+   */
   createNote(input: NewNote): Note {
     const now = new Date().toISOString();
-    const info = this.db
-      .prepare(
-        `INSERT INTO notes (title, content, created_at, updated_at)
-         VALUES (?, ?, ?, ?)`
-      )
-      .run(input.title, input.content, now, now);
+    const tx = this.db.transaction(() => {
+      const info = this.db
+        .prepare(
+          `INSERT INTO notes (title, content, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(input.title, input.content, now, now);
 
-    const id = info.lastInsertRowid as number;
-    this.extractAndSaveLinks(id, input.content);
+      const id = info.lastInsertRowid as number;
+      this.extractAndSaveLinks(id, input.content);
+      if (input.tags !== undefined) {
+        this.setTagsForItem("note", id, input.tags);
+      }
+      return id;
+    });
+
+    const id = tx();
     const created = this.getNote(id);
     if (!created) throw new Error("No se pudo crear la nota");
     return created;
   }
 
-  /** Busca una nota por id. */
+  /** Busca una nota por id (incluye etiquetas). */
   getNote(id: number): Note | null {
     const row = this.db
       .prepare("SELECT * FROM notes WHERE id = ?")
       .get(id) as any | undefined;
-    return row ? this.rowToNote(row) : null;
+    if (!row) return null;
+    return this.attachTagsToNotes([this.rowToNote(row)])[0];
   }
 
-  /** Busca una nota por título exacto. */
+  /** Busca una nota por título exacto (incluye etiquetas). */
   getNoteByTitle(title: string): Note | null {
     const row = this.db
-      .prepare("SELECT * FROM notes WHERE title = ?")
+      .prepare("SELECT * FROM notes WHERE title = ? COLLATE NOCASE")
       .get(title) as any | undefined;
-    return row ? this.rowToNote(row) : null;
+    if (!row) return null;
+    return this.attachTagsToNotes([this.rowToNote(row)])[0];
   }
 
-  /** Lista todas las notas. */
+  /** Lista todas las notas (incluye etiquetas). */
   listNotes(): Note[] {
     const rows = this.db
       .prepare("SELECT * FROM notes ORDER BY updated_at DESC")
       .all() as any[];
-    return rows.map((r) => this.rowToNote(r));
+    return this.attachTagsToNotes(rows.map((r) => this.rowToNote(r)));
   }
 
-  /** Actualiza una nota y reconstruye sus enlaces desde el nuevo contenido. */
+  /**
+   * Actualiza una nota y reconstruye sus enlaces desde el nuevo contenido.
+   * Acepta cambios solo de etiquetas (sin tocar título ni contenido).
+   */
   updateNote(id: number, patch: Partial<NewNote>): Note | null {
     const now = new Date().toISOString();
     const fields: string[] = [];
     const values: any[] = [];
+    const touchesTags = patch.tags !== undefined;
 
     if (patch.title !== undefined) {
       fields.push("title = ?");
@@ -567,27 +737,51 @@ export class TesistaDB {
       values.push(patch.content);
     }
 
-    if (fields.length === 0) return this.getNote(id);
+    if (fields.length === 0 && !touchesTags) return this.getNote(id);
+    if (!this.getNote(id)) return null;
 
-    fields.push("updated_at = ?");
-    values.push(now, id);
+    const tx = this.db.transaction(() => {
+      if (fields.length > 0) {
+        fields.push("updated_at = ?");
+        values.push(now, id);
+        this.db
+          .prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`)
+          .run(...values);
+      } else {
+        this.db
+          .prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+          .run(now, id);
+      }
 
-    this.db.prepare(
-      `UPDATE notes SET ${fields.join(", ")} WHERE id = ?`
-    ).run(...values);
+      // Reconstruir enlaces si cambió el contenido
+      if (patch.content !== undefined) {
+        this.db.prepare("DELETE FROM links WHERE source_note_id = ?").run(id);
+        this.extractAndSaveLinks(id, patch.content);
+      }
 
-    // Reconstruir enlaces si cambió el contenido
-    if (patch.content !== undefined) {
-      this.db.prepare("DELETE FROM links WHERE source_note_id = ?").run(id);
-      this.extractAndSaveLinks(id, patch.content);
-    }
+      if (touchesTags) {
+        this.setTagsForItem("note", id, patch.tags ?? []);
+      }
+    });
+    tx();
 
     return this.getNote(id);
   }
 
-  /** Elimina una nota y sus enlaces asociados (cascade por FK). */
+  /** Elimina una nota, sus enlaces (FK) y sus vínculos de etiqueta/evidencia. */
   deleteNote(id: number): boolean {
-    const info = this.db.prepare("DELETE FROM notes WHERE id = ?").run(id);
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM item_tags WHERE item_type = 'note' AND item_id = ?")
+        .run(id);
+      this.db
+        .prepare(
+          "DELETE FROM section_evidences WHERE evidence_type = 'note' AND evidence_id = ?"
+        )
+        .run(id);
+      return this.db.prepare("DELETE FROM notes WHERE id = ?").run(id);
+    });
+    const info = tx();
     return (info.changes ?? 0) > 0;
   }
 
@@ -757,10 +951,7 @@ export class TesistaDB {
   resolveTransclusion(citekey: string, locator: string): Excerpt | null {
     const source = this.getSourceByCitekey(citekey);
     if (!source || !source.id) return null;
-    const excerpts = this.listExcerptsBySource(source.id);
-    return (
-      excerpts.find((e) => e.locator === locator) ?? null
-    );
+    return this.findExcerptByLocator(source.id, locator);
   }
 
   /* ===================== Búsqueda de títulos (FTS5) ===================== */
@@ -769,22 +960,46 @@ export class TesistaDB {
    * Busca notas por coincidencia en título o contenido usando FTS5.
    * Devuelve notas ordenadas por relevancia (matchinfo simple).
    */
+  /**
+   * Busca notas por coincidencia en título o contenido usando FTS5.
+   * El término se cita para evitar errores de sintaxis de FTS con comillas,
+   * guiones o asteriscos. Si FTS falla, cae a LIKE.
+   */
   searchNotes(query: string): Note[] {
     const q = query.trim();
     if (!q) return this.listNotes();
 
-    const rows = this.db
-      .prepare(
-        `SELECT n.id, n.title, n.content, n.created_at, n.updated_at,
-                bm25(notes_fts) AS rank
-         FROM notes_fts
-         JOIN notes n ON n.id = notes_fts.rowid
-         WHERE notes_fts MATCH ?
-         ORDER BY rank
-         LIMIT 50`
-      )
-      .all(q) as any[];
-    return rows.map((r) => this.rowToNote(r));
+    // Cada palabra se convierte en una frase FTS entre comillas dobles.
+    const matchExpr = q
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((token) => `"${token.replace(/"/g, '""')}"`)
+      .join(" ");
+
+    let rows: any[] = [];
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT n.id, n.title, n.content, n.created_at, n.updated_at,
+                  bm25(notes_fts) AS rank
+           FROM notes_fts
+           JOIN notes n ON n.id = notes_fts.rowid
+           WHERE notes_fts MATCH ?
+           ORDER BY rank
+           LIMIT 50`
+        )
+        .all(matchExpr) as any[];
+    } catch {
+      rows = this.db
+        .prepare(
+          `SELECT * FROM notes
+            WHERE title LIKE ? OR content LIKE ?
+            ORDER BY updated_at DESC LIMIT 50`
+        )
+        .all(`%${q}%`, `%${q}%`) as any[];
+    }
+
+    return this.attachTagsToNotes(rows.map((r) => this.rowToNote(r)));
   }
 
   /* ===================== Hito 3: Tags ===================== */
@@ -930,10 +1145,58 @@ export class TesistaDB {
         `SELECT t.* FROM tags t
          JOIN item_tags it ON it.tag_id = t.id
          WHERE it.item_type = ? AND it.item_id = ?
-         ORDER BY t.type, t.name`
+         ORDER BY t.type, t.name COLLATE NOCASE`
       )
       .all(itemType, itemId) as any[];
     return rows.map((r) => this.rowToTag(r));
+  }
+
+  /**
+   * Busca una etiqueta por nombre (sin distinguir mayúsculas) o la crea con el
+   * tipo indicado. Evita duplicados y sirve para el ingreso libre de etiquetas.
+   */
+  ensureTag(name: string, type: TagType = "custom"): Tag {
+    const clean = name.trim().replace(/\s+/g, " ");
+    if (!clean) throw new Error("El nombre de la etiqueta no puede estar vacío.");
+    const existing = this.db
+      .prepare("SELECT * FROM tags WHERE name = ? COLLATE NOCASE")
+      .get(clean) as any | undefined;
+    if (existing) return this.rowToTag(existing);
+    return this.createTag({ name: clean, type });
+  }
+
+  /**
+   * Reemplaza el conjunto completo de etiquetas de un ítem.
+   * Crea las etiquetas que no existan y elimina los vínculos sobrantes.
+   */
+  setTagsForItem(itemType: ItemType, itemId: number, tagNames: string[]): Tag[] {
+    const unique = Array.from(
+      new Map(
+        tagNames
+          .map((n) => n.trim().replace(/\s+/g, " "))
+          .filter((n) => n.length > 0)
+          .map((n) => [n.toLowerCase(), n])
+      ).values()
+    );
+
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM item_tags WHERE item_type = ? AND item_id = ?")
+        .run(itemType, itemId);
+
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO item_tags (item_type, item_id, tag_id, created_at)
+         VALUES (?, ?, ?, ?)`
+      );
+      const now = new Date().toISOString();
+      for (const name of unique) {
+        const tag = this.ensureTag(name);
+        insert.run(itemType, itemId, tag.id, now);
+      }
+    });
+    tx();
+
+    return this.getTagsForItem(itemType, itemId);
   }
 
   /** Lista ítems de un tipo dado que tienen una etiqueta. */
@@ -960,6 +1223,9 @@ export class TesistaDB {
     const params: any[] = [];
 
     for (const cond of group.conditions) {
+      if (!ALLOWED_FILTER_FIELDS.has(cond.field)) {
+        throw new Error(`Campo de filtro no permitido: "${cond.field}".`);
+      }
       const combinator = cond.combinator || group.combinator;
       const joiner = clauses.length > 0 ? ` ${combinator} ` : "";
       let clause = "";
@@ -1073,9 +1339,13 @@ export class TesistaDB {
    * Devuelve los ids de los ítems que coinciden, útil para construir la matriz.
    */
   filterItems(
-    rootTable: "sources" | "excerpts" | "notes",
+    rootTable: "sources" | "excerpts" | "notes" | "sections" | "tags",
     group: FilterGroup
   ): number[] {
+    const allowedTables = new Set(["sources", "excerpts", "notes", "sections", "tags"]);
+    if (!allowedTables.has(rootTable)) {
+      throw new Error(`Entidad de consulta no permitida: "${rootTable}".`);
+    }
     const { where, params } = this.buildFilterSQL(group);
     const sql = `SELECT id FROM ${rootTable} ${where ? "WHERE " + where : ""}`;
     const rows = this.db.prepare(sql).all(...params) as { id: number }[];
@@ -1339,27 +1609,61 @@ export class TesistaDB {
     return roots;
   }
 
+  /** Verifica que `parentId` exista y no genere un ciclo para la sección `id`. */
+  private assertValidParent(id: number, parentId: number | null): void {
+    if (parentId === null) return;
+    if (parentId === id) {
+      throw new Error("No se puede mover una sección dentro de sí misma.");
+    }
+    const parent = this.getSection(parentId);
+    if (!parent) throw new Error("La sección padre no existe.");
+    let cursor: Section | null = parent;
+    while (cursor) {
+      if (cursor.id === id) {
+        throw new Error("No se puede mover una sección dentro de su propia descendencia.");
+      }
+      cursor = cursor.parentId ? this.getSection(cursor.parentId) : null;
+    }
+  }
+
   /** Actualiza una sección. */
   updateSection(id: number, patch: Partial<NewSection>): Section | null {
+    const existing = this.getSection(id);
+    if (!existing) return null;
+
+    const parentChanged =
+      patch.parentId !== undefined &&
+      (patch.parentId ?? null) !== (existing.parentId ?? null);
+
+    // Validar antes de escribir para no dejar la jerarquía en estado inválido.
+    if (parentChanged) {
+      this.assertValidParent(id, patch.parentId ?? null);
+    }
+
     const now = new Date().toISOString();
     const fields: string[] = [];
     const values: any[] = [];
 
     if (patch.title !== undefined) { fields.push("title = ?"); values.push(patch.title); }
     if (patch.type !== undefined) { fields.push("type = ?"); values.push(patch.type); }
-    if (patch.parentId !== undefined) { fields.push("parent_id = ?"); values.push(patch.parentId); }
-    if (patch.position !== undefined) { fields.push("position = ?"); values.push(patch.position); }
     if (patch.ownContent !== undefined) { fields.push("own_content = ?"); values.push(patch.ownContent); }
     if (patch.wordGoal !== undefined) { fields.push("word_goal = ?"); values.push(patch.wordGoal); }
 
-    if (fields.length === 0) return this.getSection(id);
+    if (fields.length > 0) {
+      fields.push("updated_at = ?");
+      values.push(now, id);
+      this.db.prepare(
+        `UPDATE sections SET ${fields.join(", ")} WHERE id = ?`
+      ).run(...values);
+    }
 
-    fields.push("updated_at = ?");
-    values.push(now, id);
-
-    this.db.prepare(
-      `UPDATE sections SET ${fields.join(", ")} WHERE id = ?`
-    ).run(...values);
+    // Cambiar de padre o de posición se delega para renormalizar a los hermanos.
+    if (parentChanged || patch.position !== undefined) {
+      this.reorderSection(id, {
+        parentId: parentChanged ? (patch.parentId ?? null) : undefined,
+        position: patch.position,
+      });
+    }
 
     return this.getSection(id);
   }
@@ -1367,37 +1671,44 @@ export class TesistaDB {
   /** Mueve una sección a una nueva posición entre sus hermanos (o nuevo padre). */
   reorderSection(
     id: number,
-    options: { parentId?: number; position?: number }
+    options: { parentId?: number | null; position?: number }
   ): boolean {
     const section = this.getSection(id);
     if (!section) return false;
 
-    const parentId = options.parentId ?? section.parentId ?? null;
+    const parentId =
+      options.parentId !== undefined ? options.parentId : (section.parentId ?? null);
 
-    // Si cambiamos de padre, recalcular posición al final si no se indica
-    let position: number;
-    if (options.position !== undefined) {
-      position = options.position;
-    } else if (options.parentId !== undefined && options.parentId !== section.parentId) {
-      const max = this.db
-        .prepare(
-          `SELECT COALESCE(MAX(position), -1) AS maxpos FROM sections WHERE parent_id IS ?`
-        )
-        .get(parentId) as { maxpos: number };
-      position = max.maxpos + 1;
-    } else {
-      position = section.position ?? 0;
-    }
+    // Evitar ciclos: el nuevo padre no puede ser la sección ni un descendiente.
+    this.assertValidParent(id, parentId);
 
-    // Desplazar hermanos afectados (solo los del mismo padre y posición >= nueva)
-    this.db.prepare(
-      `UPDATE sections SET position = position + 1
-       WHERE parent_id IS ? AND position >= ? AND id != ?`
-    ).run(parentId, position, id);
+    const tx = this.db.transaction(() => {
+      // Hermanos en el destino, sin la sección movida, en su orden actual.
+      const siblings = (
+        this.db
+          .prepare(
+            `SELECT id FROM sections
+              WHERE parent_id IS ? AND id != ?
+              ORDER BY position, id`
+          )
+          .all(parentId, id) as Array<{ id: number }>
+      ).map((r) => r.id);
 
-    this.db.prepare(
-      `UPDATE sections SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?`
-    ).run(parentId, position, new Date().toISOString(), id);
+      let index =
+        options.position !== undefined ? Math.trunc(options.position) : siblings.length;
+      if (index < 0) index = 0;
+      if (index > siblings.length) index = siblings.length;
+      siblings.splice(index, 0, id);
+
+      const now = new Date().toISOString();
+      const update = this.db.prepare(
+        "UPDATE sections SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?"
+      );
+      siblings.forEach((siblingId, position) => {
+        update.run(parentId, position, now, siblingId);
+      });
+    });
+    tx();
 
     return true;
   }
@@ -1654,12 +1965,49 @@ export class TesistaDB {
         evidenceWords: breakdown.evidenceWords,
         totalWords: total,
         ratioCitationsPerWord: Math.round(ratio * 1000) / 1000,
-        wordGoal: ch.wordGoal,
+        wordGoal: ch.wordGoal ?? undefined,
         progressPct,
       });
     }
 
     return { orphanSections, uncitedSources, chapterBalance };
+  }
+
+  /* ===================== Utilidades de mantenimiento ===================== */
+
+  /** Lista todos los vínculos ítem-etiqueta (para respaldos e integridad). */
+  listItemTags(): ItemTag[] {
+    const rows = this.db
+      .prepare("SELECT * FROM item_tags ORDER BY id")
+      .all() as any[];
+    return rows.map((r) => this.rowToItemTag(r));
+  }
+
+  /** Conteos generales para el dashboard. */
+  getStats(): {
+    sources: number;
+    excerpts: number;
+    notes: number;
+    sections: number;
+    tags: number;
+    links: number;
+  } {
+    const count = (table: string): number =>
+      (this.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+    return {
+      sources: count("sources"),
+      excerpts: count("excerpts"),
+      notes: count("notes"),
+      sections: count("sections"),
+      tags: count("tags"),
+      links: count("links"),
+    };
+  }
+
+  /** Compacta la base de datos y vacía el WAL. */
+  vacuum(): void {
+    this.db.pragma("wal_checkpoint(TRUNCATE)");
+    this.db.exec("VACUUM");
   }
 
   /* ===================== Hito 6: Enlaces (auxiliares para cascada) ===================== */

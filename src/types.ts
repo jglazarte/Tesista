@@ -79,6 +79,8 @@ export interface Note {
   id?: number;
   title: string;
   content: string;
+  /** Nombres de etiquetas vinculadas vía item_tags. */
+  tags?: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -202,10 +204,10 @@ export interface Section {
   id?: number;
   title: string;
   type: SectionType;
-  parentId?: number;
+  parentId?: number | null;
   position?: number;
   ownContent?: string;      // texto propio escrito directamente en esta sección
-  wordGoal?: number;        // meta orientativa de palabras
+  wordGoal?: number | null; // meta orientativa de palabras
   createdAt?: string;
   updatedAt?: string;
 }
@@ -239,7 +241,7 @@ export interface SectionTreeNode extends Section {
   ownWordCount: number;
   evidenceWordCount: number;
   totalWordCount: number;
-  wordGoal?: number;
+  wordGoal?: number | null;
   progressPct?: number;
 }
 
