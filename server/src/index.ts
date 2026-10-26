@@ -6,21 +6,32 @@
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import path from "path";
+import fs from "fs";
+import os from "os";
 import { TesistaDB } from "../../src/db.js";
 import { renameNoteCascade } from "../../src/cascade.js";
 import { renameCitekeyCascade } from "../../src/cascade.js";
 import { searchFullText } from "../../src/fts.js";
 import { getIntegrityReport } from "../../src/integrity.js";
-import { createBackup, isBackupAvailable } from "../../src/backup.js";
+import { createBackup, isBackupAvailable, listBackups, restoreBackupToDatabase } from "../../src/backup.js";
 import { exportChapter, saveAndConvert } from "../../src/export.js";
 import { resolveSourceFromCrossRef } from "../../src/crossref.js";
 import { fetchOpenAlexByDoi } from "../../src/openalex.js";
 import {
   isGitAvailable,
+  isGitRepo,
   gitStatus,
   gitLog,
   gitCommit,
   gitDiff,
+  gitRemote,
+  gitBranch,
+  gitSetRemote,
+  gitPush,
+  gitPull,
+  gitRestoreCommit,
+  gitIsTracked,
+  gitIsIgnored,
   ensureGitRepo,
   ensureGitUser,
 } from "../../src/git.js";
@@ -37,10 +48,209 @@ app.use(express.json({ limit: "10mb" }));
 const dbPath = process.env.TESISTA_DB
   ? path.resolve(process.env.TESISTA_DB)
   : path.resolve(process.cwd(), "../data/tesista.db");
-const db = new TesistaDB(dbPath);
+let db = new TesistaDB(dbPath);
 
-// Directorio raíz del proyecto (para Git y respaldos)
+// Directorio raíz de la aplicación (valor por defecto del workspace).
 const projectRoot = path.resolve(process.cwd(), "..");
+
+/* ===================== Workspace configurable ===================== */
+
+type WorkspaceSource = "settings" | "env" | "default";
+
+interface ResolvedWorkspace {
+  /** Ruta efectiva usada para Git, respaldos y exportaciones. */
+  path: string;
+  /** De dónde proviene la ruta efectiva. */
+  source: WorkspaceSource;
+  /** Valor configurado desde la interfaz (aunque ya no exista). */
+  configured: string | null;
+  warning?: string;
+}
+
+/** Expande `~` y resuelve rutas relativas contra la raíz de la aplicación. */
+function expandUserPath(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+  return path.resolve(projectRoot, trimmed);
+}
+
+function isDirectory(target: string): boolean {
+  try {
+    return fs.statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isWritableDirectory(target: string): boolean {
+  try {
+    fs.accessSync(target, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resuelve el workspace efectivo con esta precedencia:
+ *   1. Configuración guardada desde la interfaz (si la carpeta existe).
+ *   2. Variable de entorno TESISTA_WORKSPACE.
+ *   3. Carpeta de la aplicación.
+ */
+function resolveWorkspace(): ResolvedWorkspace {
+  const configuredRaw = db.getSetting("workspace_path");
+  if (configuredRaw) {
+    const resolved = expandUserPath(configuredRaw);
+    if (isDirectory(resolved)) {
+      return { path: resolved, source: "settings", configured: resolved };
+    }
+    return {
+      path: projectRoot,
+      source: "default",
+      configured: resolved,
+      warning: `La carpeta configurada (${resolved}) no está disponible; se usa la carpeta de la aplicación.`,
+    };
+  }
+
+  const envRaw = process.env.TESISTA_WORKSPACE;
+  if (envRaw && envRaw.trim().length > 0) {
+    const resolved = expandUserPath(envRaw);
+    if (isDirectory(resolved)) {
+      return { path: resolved, source: "env", configured: null };
+    }
+  }
+
+  return { path: projectRoot, source: "default", configured: null };
+}
+
+/** Describe el workspace y el estado de su repositorio para la interfaz. */
+function workspaceInfo() {
+  const ws = resolveWorkspace();
+  const exists = isDirectory(ws.path);
+  const repo = exists && isGitRepo(ws.path);
+  const configuredRemote = db.getSetting("git_remote");
+  const repoRemote = repo ? gitRemote(ws.path) : null;
+
+  return {
+    path: ws.path,
+    source: ws.source,
+    configured: ws.configured,
+    defaultPath: projectRoot,
+    exists,
+    writable: exists && isWritableDirectory(ws.path),
+    isGitRepo: repo,
+    gitAvailable: isGitAvailable(),
+    branch: repo ? gitBranch(ws.path) : null,
+    remote: repoRemote ?? configuredRemote ?? null,
+    remoteConfigured: configuredRemote ?? null,
+    remoteMatchesConfig:
+      configuredRemote === null ? null : repoRemote === configuredRemote,
+    backupsDir: path.join(ws.path, "backups"),
+    exportDir: path.join(ws.path, "export"),
+    warning: ws.warning ?? null,
+  };
+}
+
+/**
+ * Valida una URL de remoto. Devuelve `null` para "sin remoto",
+ * `undefined` si el valor es inválido y el string limpio si es válido.
+ */
+function normalizeRemoteUrl(raw: unknown): string | null | undefined {
+  if (raw === null) return null;
+  if (typeof raw !== "string") return undefined;
+  const url = raw.trim();
+  if (url.length === 0) return null;
+  if (/[\r\n\t]/.test(url) || /\s/.test(url)) return undefined;
+  if (url.startsWith("-")) return undefined;
+  return url;
+}
+
+/** Resuelve una ruta de salida: absoluta tal cual, relativa al workspace. */
+function resolveOutputPath(requested: string, workspace: string): string {
+  return path.isAbsolute(requested)
+    ? path.normalize(requested)
+    : path.resolve(workspace, requested);
+}
+
+/** Texto legible para cualquier valor lanzado como error. */
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return String(err);
+}
+
+/**
+ * Vuelca el WAL al archivo principal antes de un commit. Sin esto, un commit
+ * podría guardar una versión desactualizada de la base SQLite.
+ */
+function checkpointDatabase(): void {
+  try {
+    db.getDb().pragma("wal_checkpoint(TRUNCATE)");
+  } catch {
+    // Si falla, el commit sigue; solo se pierde precisión en la instantánea.
+  }
+}
+
+/**
+ * Ejecuta una operación que puede reemplazar archivos del workspace con la
+ * base SQLite cerrada.
+ *
+ * Cerrar la base fuerza el checkpoint del WAL y evita que Git reemplace el
+ * archivo mientras SQLite lo tiene abierto. Al terminar se reabre y se
+ * conservan `workspace_path` y `git_remote`, que son específicos de cada
+ * dispositivo y no deberían viajar al restaurar datos de otra máquina.
+ */
+function withDatabaseClosed<T>(action: () => T): T {
+  let preserveWorkspace: string | null = null;
+  let preserveRemote: string | null = null;
+  try {
+    preserveWorkspace = db.getSetting("workspace_path");
+    preserveRemote = db.getSetting("git_remote");
+  } catch {
+    // Si no se pueden leer, se usan los valores de la base restaurada.
+  }
+
+  let actionResult: T | undefined;
+  let actionError: unknown;
+  try {
+    db.close();
+  } catch (err) {
+    actionError = err;
+  }
+
+  if (!actionError) {
+    try {
+      actionResult = action();
+    } catch (err) {
+      actionError = err;
+    }
+  }
+
+  let reopenError: unknown;
+  try {
+    db = new TesistaDB(dbPath);
+    if (db.getSetting("workspace_path") !== preserveWorkspace) {
+      db.setSetting("workspace_path", preserveWorkspace);
+    }
+    if (db.getSetting("git_remote") !== preserveRemote) {
+      db.setSetting("git_remote", preserveRemote);
+    }
+  } catch (err) {
+    reopenError = err;
+  }
+
+  if (reopenError) {
+    const detail = actionError
+      ? `Error original: ${errorText(actionError)}. `
+      : "";
+    throw new Error(
+      `${detail}No se pudo reabrir la base de datos (${dbPath}): ${errorText(reopenError)}`
+    );
+  }
+  if (actionError) throw actionError;
+  return actionResult as T;
+}
 
 // Middleware de logging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -679,6 +889,88 @@ app.get("/api/stats", (_req: Request, res: Response) => {
   }
 });
 
+// ===================== WORKSPACE (repositorio de trabajo) =====================
+
+app.get("/api/workspace", (_req: Request, res: Response) => {
+  try {
+    res.json(workspaceInfo());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/workspace", (req: Request, res: Response) => {
+  try {
+    const raw = req.body?.path;
+
+    // `null` o cadena vacía: volver a la carpeta de la aplicación.
+    if (raw === null || raw === undefined || (typeof raw === "string" && raw.trim() === "")) {
+      db.setSetting("workspace_path", null);
+      return res.json({ success: true, reset: true, ...workspaceInfo() });
+    }
+
+    if (typeof raw !== "string") {
+      return res.status(400).json({ error: "La ruta debe ser una cadena de texto." });
+    }
+    if (/[\r\n]/.test(raw)) {
+      return res.status(400).json({ error: "La ruta contiene caracteres inválidos." });
+    }
+
+    const resolved = expandUserPath(raw);
+    if (!isDirectory(resolved)) {
+      return res.status(400).json({
+        error: `La carpeta no existe o no es un directorio: ${resolved}`,
+      });
+    }
+    if (!isWritableDirectory(resolved)) {
+      return res.status(400).json({
+        error: `La carpeta no tiene permisos de escritura: ${resolved}`,
+      });
+    }
+
+    db.setSetting("workspace_path", resolved);
+
+    // Si ya hay un remoto configurado y la carpeta es un repositorio,
+    // se aplica de inmediato para que el panel muestre el destino correcto.
+    const configuredRemote = db.getSetting("git_remote");
+    if (configuredRemote && isGitRepo(resolved)) {
+      try {
+        gitSetRemote(resolved, configuredRemote);
+      } catch (err: any) {
+        console.warn("No se pudo aplicar el remoto configurado:", err?.message ?? err);
+      }
+    }
+
+    res.json({ success: true, ...workspaceInfo() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/workspace/remote", (req: Request, res: Response) => {
+  try {
+    const url = normalizeRemoteUrl(req.body?.url);
+    if (url === undefined) {
+      return res.status(400).json({
+        error: "La URL del remoto no es válida. Ejemplo: https://github.com/usuario/repositorio.git",
+      });
+    }
+
+    db.setSetting("git_remote", url);
+
+    const ws = resolveWorkspace();
+    let applied = false;
+    if (url && isGitRepo(ws.path)) {
+      gitSetRemote(ws.path, url);
+      applied = true;
+    }
+
+    res.json({ success: true, applied, ...workspaceInfo() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===================== RESPALDOS =====================
 
 app.post("/api/backup", (req: Request, res: Response) => {
@@ -686,17 +978,127 @@ app.post("/api/backup", (req: Request, res: Response) => {
     if (!isBackupAvailable()) {
       return res.status(500).json({ error: "Backup no disponible (falta tar)" });
     }
-    // Ruta por defecto: backups/tesista-<fecha>.tar.gz dentro del proyecto.
+    const ws = resolveWorkspace();
+    // Ruta por defecto: <workspace>/backups/tesista-<fecha>.tar.gz
     const requested = req.body?.outputPath;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const outputPath =
       typeof requested === "string" && requested.trim().length > 0
-        ? path.resolve(requested)
-        : path.join(projectRoot, "backups", `tesista-${stamp}.tar.gz`);
+        ? resolveOutputPath(requested.trim(), ws.path)
+        : path.join(ws.path, "backups", `tesista-${stamp}.tar.gz`);
     const result = createBackup(db, outputPath);
-    res.json(result);
+
+    // Commit y push opcionales del respaldo dentro del workspace.
+    const doCommit = req.body?.commit === true;
+    const doPush = req.body?.push === true;
+    let git:
+      | {
+          commit: {
+            success: boolean;
+            message: string;
+            hash?: string;
+            error?: string;
+            backupTracked?: boolean;
+          };
+          push?: { success: boolean; message?: string; error?: string };
+        }
+      | undefined;
+
+    if (doCommit || doPush) {
+      const message =
+        typeof req.body?.message === "string" && req.body.message.trim().length > 0
+          ? req.body.message.trim()
+          : "Respaldo Tesista";
+
+      if (!isGitRepo(ws.path)) {
+        git = {
+          commit: {
+            success: false,
+            message,
+            error: `El workspace no es un repositorio Git: ${ws.path}`,
+          },
+        };
+      } else {
+        const relativePath = path.relative(ws.path, outputPath);
+        const outsideRepo =
+          relativePath.startsWith("..") || path.isAbsolute(relativePath);
+        const ignored = !outsideRepo && gitIsIgnored(ws.path, relativePath);
+
+        if (outsideRepo) {
+          git = {
+            commit: {
+              success: false,
+              message,
+              error: `El respaldo se guardó fuera del repositorio (${outputPath}), así que no puede versionarse.`,
+            },
+          };
+        } else if (ignored) {
+          git = {
+            commit: {
+              success: false,
+              message,
+              error: `La ruta "${relativePath}" está ignorada por .gitignore; el respaldo no se versionó.`,
+            },
+          };
+        } else {
+          ensureGitUser(ws.path);
+          checkpointDatabase();
+          const commit = gitCommit(ws.path, message);
+          const backupTracked = commit.success
+            ? gitIsTracked(ws.path, relativePath)
+            : false;
+          git = { commit: { ...commit, backupTracked } };
+          if (commit.success && doPush) {
+            git.push = gitPush(ws.path);
+          }
+        }
+      }
+    }
+
+    res.json({ ...result, git });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/** Lista los respaldos disponibles en <workspace>/backups. */
+app.get("/api/backups", (_req: Request, res: Response) => {
+  try {
+    const ws = resolveWorkspace();
+    res.json(listBackups(path.join(ws.path, "backups")));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Restaura la base de datos activa desde un respaldo.
+ * Antes de reemplazarla se guarda una copia de la base actual.
+ */
+app.post("/api/backups/restore", (req: Request, res: Response) => {
+  try {
+    if (!isBackupAvailable()) {
+      return res.status(500).json({ error: "Backup no disponible (falta tar)" });
+    }
+    const requested = req.body?.path;
+    if (typeof requested !== "string" || requested.trim().length === 0) {
+      return res.status(400).json({ error: "Se requiere la ruta de un respaldo." });
+    }
+
+    const ws = resolveWorkspace();
+    const backupPath = resolveOutputPath(requested.trim(), ws.path);
+    const result = withDatabaseClosed(() =>
+      restoreBackupToDatabase(backupPath, dbPath)
+    );
+
+    res.json({
+      success: true,
+      ...result,
+      workspace: ws.path,
+      message: "Respaldo restaurado en la base de datos activa.",
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -729,10 +1131,11 @@ app.post("/api/export/chapter", async (req: Request, res: Response) => {
 
     let outputPath: string | undefined;
     if (save) {
+      const ws = resolveWorkspace();
       const dir =
         typeof outputDir === "string" && outputDir.trim().length > 0
-          ? path.resolve(outputDir)
-          : path.join(projectRoot, "export");
+          ? resolveOutputPath(outputDir.trim(), ws.path)
+          : path.join(ws.path, "export");
       outputPath = await saveAndConvert(result, dir, format);
     }
 
@@ -746,9 +1149,11 @@ app.post("/api/export/chapter", async (req: Request, res: Response) => {
 
 app.get("/api/git/status", (_req: Request, res: Response) => {
   try {
+    const ws = resolveWorkspace();
     res.json({
       available: isGitAvailable(),
-      ...gitStatus(projectRoot),
+      workspace: ws.path,
+      ...gitStatus(ws.path),
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -761,7 +1166,7 @@ app.get("/api/git/log", (req: Request, res: Response) => {
       Math.max(Number.parseInt(String(req.query.limit ?? "20"), 10) || 20, 1),
       200
     );
-    res.json(gitLog(projectRoot, limit));
+    res.json(gitLog(resolveWorkspace().path, limit));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -772,7 +1177,7 @@ app.get("/api/git/diff", (req: Request, res: Response) => {
     const from = req.query.from as string | undefined;
     const to = req.query.to as string | undefined;
     const file = req.query.file as string | undefined;
-    res.json({ diff: gitDiff(projectRoot, { from, to, file }) });
+    res.json({ diff: gitDiff(resolveWorkspace().path, { from, to, file }) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -780,16 +1185,18 @@ app.get("/api/git/diff", (req: Request, res: Response) => {
 
 app.post("/api/git/commit", (req: Request, res: Response) => {
   try {
+    const ws = resolveWorkspace();
+    // El mensaje vacío se completa en gitCommit con «Tesista: instantánea»
+    // y la fecha/hora local.
     const message =
-      typeof req.body?.message === "string" && req.body.message.trim().length > 0
-        ? req.body.message.trim()
-        : `Tesista: instantánea ${new Date().toISOString()}`;
-    ensureGitUser(projectRoot);
-    const result = gitCommit(projectRoot, message);
+      typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    ensureGitUser(ws.path);
+    checkpointDatabase();
+    const result = gitCommit(ws.path, message);
     if (!result.success) {
       return res.status(400).json(result);
     }
-    res.json(result);
+    res.json({ ...result, workspace: ws.path });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -800,8 +1207,134 @@ app.post("/api/git/init", (_req: Request, res: Response) => {
     if (!isGitAvailable()) {
       return res.status(500).json({ error: "Git no está instalado en el sistema." });
     }
-    ensureGitRepo(projectRoot);
-    res.json({ success: true, ...gitStatus(projectRoot) });
+    const ws = resolveWorkspace();
+    ensureGitRepo(ws.path);
+
+    // Aplicar el remoto configurado, si existe.
+    const configuredRemote = db.getSetting("git_remote");
+    if (configuredRemote) {
+      gitSetRemote(ws.path, configuredRemote);
+    }
+
+    res.json({
+      success: true,
+      workspace: ws.path,
+      ...gitStatus(ws.path),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/git/push", (req: Request, res: Response) => {
+  try {
+    const ws = resolveWorkspace();
+    if (!isGitRepo(ws.path)) {
+      return res.status(400).json({
+        success: false,
+        error: `El workspace no es un repositorio Git: ${ws.path}`,
+      });
+    }
+    const branch =
+      typeof req.body?.branch === "string" && req.body.branch.trim().length > 0
+        ? req.body.branch.trim()
+        : undefined;
+
+    // Push automático: si hay cambios pendientes, primero se guarda un commit
+    // con fecha y hora. `commit: false` permite forzar un push sin commitear.
+    let commit: ReturnType<typeof gitCommit> | undefined;
+    if (req.body?.commit !== false) {
+      checkpointDatabase();
+      if (!gitStatus(ws.path).clean) {
+        ensureGitUser(ws.path);
+        commit = gitCommit(
+          ws.path,
+          typeof req.body?.message === "string" ? req.body.message.trim() : ""
+        );
+        if (!commit.success) {
+          return res.status(400).json({
+            success: false,
+            error: commit.error ?? "No se pudieron guardar los cambios antes de subir.",
+            commit,
+          });
+        }
+      }
+    }
+
+    const result = gitPush(ws.path, { branch });
+    if (!result.success) {
+      const saved =
+        commit?.success && commit.hash
+          ? ` Los cambios quedaron guardados en el commit local ${commit.hash.slice(0, 8)}.`
+          : "";
+      return res.status(400).json({
+        ...result,
+        error: `${result.error ?? "No se pudo subir al remoto."}${saved}`,
+        commit,
+      });
+    }
+    res.json({ ...result, commit });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/git/pull", (req: Request, res: Response) => {
+  try {
+    if (!isGitAvailable()) {
+      return res.status(500).json({ error: "Git no está instalado en el sistema." });
+    }
+    const ws = resolveWorkspace();
+    if (!isGitRepo(ws.path)) {
+      return res.status(400).json({
+        success: false,
+        error: `El workspace no es un repositorio Git: ${ws.path}`,
+      });
+    }
+
+    const branch =
+      typeof req.body?.branch === "string" && req.body.branch.trim().length > 0
+        ? req.body.branch.trim()
+        : undefined;
+    const mode = req.body?.mode === "reset" ? "reset" : "ff-only";
+
+    // La base se cierra durante el pull: Git puede reemplazar data/tesista.db
+    // cuando vive dentro del repositorio.
+    const result = withDatabaseClosed(() => gitPull(ws.path, { branch, mode }));
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json({ ...result, workspace: ws.path });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/git/restore", (req: Request, res: Response) => {
+  try {
+    const ws = resolveWorkspace();
+    if (!isGitRepo(ws.path)) {
+      return res.status(400).json({
+        success: false,
+        error: `El workspace no es un repositorio Git: ${ws.path}`,
+      });
+    }
+
+    const commit = req.body?.commit;
+    if (typeof commit !== "string" || commit.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requiere el hash del commit a restaurar.",
+      });
+    }
+
+    const result = withDatabaseClosed(() =>
+      gitRestoreCommit(ws.path, commit.trim())
+    );
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json({ ...result, workspace: ws.path });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -881,9 +1414,11 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 // Iniciar servidor
 const server = app.listen(PORT, HOST, () => {
+  const ws = resolveWorkspace();
   console.log(`Tesista Server escuchando en http://${HOST}:${PORT}`);
   console.log(`Base de datos: ${dbPath}`);
-  console.log(`Raíz del proyecto: ${projectRoot}`);
+  console.log(`Workspace (${ws.source}): ${ws.path}`);
+  if (ws.warning) console.warn(`Aviso: ${ws.warning}`);
 });
 
 function shutdown(signal: string): void {

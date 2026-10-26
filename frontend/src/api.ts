@@ -356,17 +356,62 @@ export const integrityApi = {
 };
 
 // ===================== Backup =====================
+export interface BackupGitInfo {
+  commit: {
+    success: boolean;
+    message: string;
+    hash?: string;
+    error?: string;
+    backupTracked?: boolean;
+  };
+  push?: {
+    success: boolean;
+    message?: string;
+    error?: string;
+  };
+}
+
 export interface BackupResult {
   outputPath: string;
   sizeBytes: number;
   includedFiles: string[];
   createdAt: string;
+  git?: BackupGitInfo;
+}
+
+export interface BackupFileInfo {
+  path: string;
+  fileName: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+export interface BackupRestoreResult {
+  success: boolean;
+  backupPath: string;
+  safetyCopyPath?: string;
+  restoredAt?: string;
+  workspace?: string;
+  message?: string;
 }
 
 export const backupApi = {
-  create: (outputPath?: string) =>
+  create: (
+    outputPath?: string,
+    options?: { commit?: boolean; push?: boolean; message?: string }
+  ) =>
     api
-      .post<BackupResult>("/backup", outputPath ? { outputPath } : {})
+      .post<BackupResult>("/backup", {
+        ...(outputPath ? { outputPath } : {}),
+        ...(options?.commit ? { commit: true } : {}),
+        ...(options?.push ? { push: true } : {}),
+        ...(options?.message ? { message: options.message } : {}),
+      })
+      .then((r) => r.data),
+  list: () => api.get<BackupFileInfo[]>("/backups").then((r) => r.data),
+  restore: (backupPath: string) =>
+    api
+      .post<BackupRestoreResult>("/backups/restore", { path: backupPath })
       .then((r) => r.data),
 };
 
@@ -397,12 +442,49 @@ export const exportApi = {
     api.post("/export/chapter", { sectionId, metadata, ...options }).then((r) => r.data),
 };
 
+// ===================== Workspace =====================
+export interface WorkspaceInfo {
+  path: string;
+  source: "settings" | "env" | "default";
+  configured: string | null;
+  defaultPath: string;
+  exists: boolean;
+  writable: boolean;
+  isGitRepo: boolean;
+  gitAvailable: boolean;
+  branch: string | null;
+  remote: string | null;
+  remoteConfigured: string | null;
+  remoteMatchesConfig: boolean | null;
+  backupsDir: string;
+  exportDir: string;
+  warning: string | null;
+  success?: boolean;
+  reset?: boolean;
+  applied?: boolean;
+}
+
+export const workspaceApi = {
+  get: () => api.get<WorkspaceInfo>("/workspace").then((r) => r.data),
+  update: (path: string | null) =>
+    api.put<WorkspaceInfo>("/workspace", { path }).then((r) => r.data),
+  setRemote: (url: string | null) =>
+    api.put<WorkspaceInfo>("/workspace/remote", { url }).then((r) => r.data),
+};
+
 // ===================== Git =====================
 export interface GitStatus {
   available: boolean;
+  workspace?: string;
   initialized: boolean;
   clean: boolean;
   changedFiles: string[];
+  branch?: string | null;
+  remote?: string | null;
+  hasUpstream?: boolean;
+  ahead?: number;
+  behind?: number;
+  lastCommit?: { hash: string; message: string; date: string } | null;
 }
 
 export interface GitLogEntry {
@@ -419,6 +501,40 @@ export interface GitCommitResult {
   error?: string;
 }
 
+export interface GitPushResult {
+  success: boolean;
+  branch?: string;
+  remote?: string;
+  message?: string;
+  error?: string;
+  commit?: GitCommitResult;
+}
+
+export interface GitPullResult {
+  success: boolean;
+  mode: "ff-only" | "reset";
+  branch?: string;
+  remote?: string;
+  updated?: boolean;
+  previousHead?: string;
+  newHead?: string;
+  safetyCommit?: string;
+  safetyBranch?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface GitRestoreResult {
+  success: boolean;
+  commit?: string;
+  previousHead?: string;
+  newHead?: string;
+  safetyCommit?: string;
+  changed?: boolean;
+  message?: string;
+  error?: string;
+}
+
 export const gitApi = {
   status: () => api.get<GitStatus>("/git/status").then((r) => r.data),
   log: (limit = 20) =>
@@ -430,6 +546,12 @@ export const gitApi = {
   commit: (message: string) =>
     api.post<GitCommitResult>("/git/commit", { message }).then((r) => r.data),
   init: () => api.post("/git/init").then((r) => r.data),
+  push: (options?: { branch?: string; message?: string }) =>
+    api.post<GitPushResult>("/git/push", options ?? {}).then((r) => r.data),
+  pull: (mode: "ff-only" | "reset" = "ff-only") =>
+    api.post<GitPullResult>("/git/pull", { mode }).then((r) => r.data),
+  restoreCommit: (commit: string) =>
+    api.post<GitRestoreResult>("/git/restore", { commit }).then((r) => r.data),
 };
 
 // ===================== Mantenimiento =====================

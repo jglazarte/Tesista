@@ -330,6 +330,19 @@ export interface BackupResult {
   createdAt: string;
 }
 
+export interface BackupFileInfo {
+  path: string;
+  fileName: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+export interface BackupRestoreResult {
+  backupPath: string;
+  safetyCopyPath?: string;
+  restoredAt: string;
+}
+
 /* ===================== Hito 6: Git ===================== */
 
 export interface GitCommitResult {
@@ -350,6 +363,57 @@ export interface GitStatusResult {
   initialized: boolean;
   clean: boolean;
   changedFiles: string[];
+  /** Rama activa, o null si el repositorio no tiene commits. */
+  branch?: string | null;
+  /** URL del remoto `origin`, si existe. */
+  remote?: string | null;
+  /** Indica si la rama activa sigue a un remoto. */
+  hasUpstream?: boolean;
+  ahead?: number;
+  behind?: number;
+  /** Hash y mensaje del último commit, para mostrar contexto. */
+  lastCommit?: { hash: string; message: string; date: string } | null;
+}
+
+export interface GitPushResult {
+  success: boolean;
+  branch?: string;
+  remote?: string;
+  message?: string;
+  error?: string;
+  /** Commit automático creado antes de subir, si había cambios pendientes. */
+  commit?: GitCommitResult;
+}
+
+export interface GitPullResult {
+  success: boolean;
+  /** `ff-only` no reescribe historia; `reset` reemplaza lo local por el remoto. */
+  mode: "ff-only" | "reset";
+  branch?: string;
+  remote?: string;
+  /** Indica si HEAD cambió como consecuencia de la operación. */
+  updated?: boolean;
+  previousHead?: string;
+  newHead?: string;
+  /** Commit que guarda los cambios locales antes de una operación destructiva. */
+  safetyCommit?: string;
+  /** Rama que apunta al estado anterior, para poder volver atrás. */
+  safetyBranch?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface GitRestoreResult {
+  success: boolean;
+  /** Commit solicitado (hash resuelto). */
+  commit?: string;
+  previousHead?: string;
+  newHead?: string;
+  safetyCommit?: string;
+  /** `false` si el árbol ya coincidía con la versión pedida. */
+  changed?: boolean;
+  message?: string;
+  error?: string;
 }
 
 /* ===================== Hito 5: Consultas dinámicas ===================== */

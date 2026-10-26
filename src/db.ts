@@ -194,6 +194,12 @@ export class TesistaDB {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS sections (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
@@ -285,6 +291,44 @@ export class TesistaDB {
     } catch {
       return null;
     }
+  }
+
+  /* ===================== Configuración de la aplicación ===================== */
+
+  /** Lee una preferencia persistente (workspace, remoto Git, etc.). */
+  getSetting(key: string): string | null {
+    const row = this.db
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(key) as { value: string } | undefined;
+    return row ? row.value : null;
+  }
+
+  /** Devuelve todas las preferencias persistidas como objeto clave-valor. */
+  getSettings(): Record<string, string> {
+    const rows = this.db
+      .prepare("SELECT key, value FROM app_settings")
+      .all() as Array<{ key: string; value: string }>;
+    const settings: Record<string, string> = {};
+    for (const row of rows) settings[row.key] = row.value;
+    return settings;
+  }
+
+  /**
+   * Guarda una preferencia. Un valor `null` o vacío elimina la clave para
+   * volver al comportamiento por defecto.
+   */
+  setSetting(key: string, value: string | null): void {
+    if (value === null || value.trim().length === 0) {
+      this.db.prepare("DELETE FROM app_settings WHERE key = ?").run(key);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(key, value.trim(), new Date().toISOString());
   }
 
   /* ===================== Sources ===================== */

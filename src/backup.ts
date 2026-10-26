@@ -19,7 +19,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import type { BackupResult } from "./types.js";
+import type { BackupResult, BackupFileInfo, BackupRestoreResult } from "./types.js";
 
 export type BackupFormat = "tar.gz";
 
@@ -162,6 +162,127 @@ function slugFileName(title: string): string {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 60) || "nota";
+}
+
+/**
+ * Lista los respaldos `.tar.gz`/`.tgz` disponibles en un directorio.
+ * Se ordenan del más reciente al más antiguo.
+ */
+export function listBackups(dir: string): BackupFileInfo[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter(
+        (entry) =>
+          entry.isFile() && /\.(tar\.gz|tgz)$/i.test(entry.name)
+      )
+      .map((entry) => {
+        const fullPath = path.join(dir, entry.name);
+        const stat = fs.statSync(fullPath);
+        return {
+          path: fullPath,
+          fileName: entry.name,
+          sizeBytes: stat.size,
+          createdAt: stat.mtime.toISOString(),
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    return [];
+  }
+}
+
+/** Comprueba que el archivo tenga la cabecera de una base SQLite. */
+function isSqliteFile(filePath: string): boolean {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const header = Buffer.alloc(16);
+      const read = fs.readSync(fd, header, 0, header.length, 0);
+      return (
+        read === header.length &&
+        header.toString("utf-8") === "SQLite format 3\u0000"
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restaura la base de datos activa desde un respaldo `.tar.gz`.
+ *
+ * Antes de reemplazarla guarda una copia de la base actual junto al archivo
+ * original (`<db>.bak-<fecha>`), para poder volver atrás. La base debe estar
+ * cerrada: el servidor se encarga de cerrarla y reabrirla.
+ */
+export function restoreBackupToDatabase(
+  backupPath: string,
+  dbPath: string
+): BackupRestoreResult {
+  const archive = path.resolve(backupPath);
+  if (!fs.existsSync(archive)) {
+    throw new Error(`No existe el respaldo: ${archive}`);
+  }
+  if (!/\.(tar\.gz|tgz)$/i.test(archive)) {
+    throw new Error("El respaldo debe ser un archivo .tar.gz o .tgz.");
+  }
+
+  const entry = listBackupContents(archive).find(
+    (item) => item.replace(/^\.\//, "") === "data/tesista.db"
+  );
+  if (!entry) {
+    throw new Error(
+      "El respaldo no contiene data/tesista.db; no parece un respaldo de Tesista."
+    );
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tesista-restore-"));
+  try {
+    execFileSync("tar", ["-xzf", archive, "-C", tmpDir, entry], {
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 120000,
+    });
+
+    const extracted = path.join(tmpDir, "data", "tesista.db");
+    if (!fs.existsSync(extracted) || !isSqliteFile(extracted)) {
+      throw new Error("La base incluida en el respaldo no es un archivo SQLite válido.");
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let safetyCopyPath: string | undefined;
+    if (fs.existsSync(dbPath)) {
+      safetyCopyPath = `${dbPath}.bak-${stamp}`;
+      fs.copyFileSync(dbPath, safetyCopyPath);
+    }
+
+    // Descartar restos de WAL/SHM de la base anterior: el archivo nuevo
+    // reemplaza por completo a la base activa.
+    for (const suffix of ["-wal", "-shm"]) {
+      try {
+        fs.rmSync(`${dbPath}${suffix}`, { force: true });
+      } catch {
+        // ignorar
+      }
+    }
+
+    fs.copyFileSync(extracted, dbPath);
+
+    return {
+      backupPath: archive,
+      safetyCopyPath,
+      restoredAt: new Date().toISOString(),
+    };
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignorar
+    }
+  }
 }
 
 /**

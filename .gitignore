@@ -21,6 +21,9 @@ frontend/dist/
 data/*.db-wal
 data/*.db-shm
 
+# Copias locales previas a restaurar un respaldo
+*.db.bak-*
+
 # Salidas generadas por la aplicación
 backups/
 export/

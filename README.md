@@ -37,8 +37,8 @@ tesista/
 │   └── images/             # Capturas usadas en la guía de uso
 ├── scripts/
 │   └── start-tesista.sh    # Arranca backend y frontend en paralelo
-├── backups/                # (generado, ignorado) respaldos .tar.gz desde la UI
-├── export/                 # (generado, ignorado) capítulos exportados desde la UI
+├── backups/                # (generado, ignorado) respaldos si el workspace es la app
+├── export/                 # (generado, ignorado) capítulos exportados si el workspace es la app
 │
 ├── src/                    # Capa de datos (Node.js + SQLite + TypeScript)
 │   ├── types.ts            # Tipos de dominio compartidos
@@ -147,8 +147,8 @@ tesista/
 - **Actualización en cascada**: Al renombrar título de nota o clave BibTeX, se escanea y reemplaza automáticamente todas las instancias `[[Nota Antigua]]` o `@claveAntigua` en el corpus
 - **Diagnóstico de integridad**: Detección de enlaces rotos, secciones huérfanas, fuentes no citadas y claves duplicadas
 - **Búsqueda de texto completo extendida**: Índices FTS5 para sources, excerpts, notes y sections; búsqueda difusa por trigramas
-- **Respaldos**: Paquete `.tar.gz` con base de datos SQLite, JSON de todas las tablas y archivos Markdown planos
-- **Integración Git**: Inicialización de repositorio, commits, historial (log), estado (status) y diffs
+- **Respaldos**: Paquete `.tar.gz` con base de datos SQLite, JSON de todas las tablas y archivos Markdown planos; incluye restauración de un respaldo sobre la base activa con copia previa
+- **Integración Git**: Elección del repositorio y su remoto, inicialización, commits con fecha y hora automáticas, push, pull (avance rápido o reemplazo), historial (log), estado (status), diffs y restauración de versiones
 - **Interfaz completa en el navegador**: Dashboard con métricas, editor de notas grande, gestión de etiquetas, matriz interactiva y panel de configuración (tema oscuro, mantenimiento, respaldos y Git)
 
 ---
@@ -255,6 +255,8 @@ node dist/index.js export-bibtex
 ```
 
 > La base de datos se guarda en `data/tesista.db`. Para usar otra ruta, definí `TESISTA_DB=/ruta/a/otra.db` antes de iniciar el backend o la CLI.
+>
+> El repositorio de trabajo (Git, respaldos y exportaciones) se elige desde **Configuración → Git**. También se puede fijar al arrancar con `TESISTA_WORKSPACE=/ruta/a/tu/tesis`; la configuración guardada en la app tiene prioridad.
 
 ---
 
@@ -409,7 +411,7 @@ El icono de alerta en la cabecera del árbol (junto al de recarga) abre el repor
 4. Marcá **Guardar el archivo en el servidor** y elegí formato: Markdown, LaTeX, PDF, Word o Typst.
 5. **Exportar** genera el resultado; **Descargar Markdown** lo baja desde el navegador.
 
-La salida incluye frontmatter YAML, citas resueltas y bibliografía. Los formatos distintos de Markdown requieren **Pandoc** instalado; la carpeta por defecto es `export/`.
+La salida incluye frontmatter YAML, citas resueltas y bibliografía. Los formatos distintos de Markdown requieren **Pandoc** instalado; la carpeta por defecto es `export/` dentro del repositorio de trabajo (§5.10).
 
 ### 5.10 Configuración y respaldos
 
@@ -429,16 +431,47 @@ La salida incluye frontmatter YAML, citas resueltas y bibliografía. Los formato
 
 **Respaldos**
 
-1. Opcional: indicá una ruta de salida (por defecto `backups/tesista-<fecha>.tar.gz`).
-2. **Crear respaldo ahora**.
-3. El `.tar.gz` incluye la base con checkpoint del WAL, JSON de las tablas, notas en Markdown y un manifiesto.
+1. Revisá el **repositorio de respaldo** que se muestra arriba: es la carpeta elegida en la pestaña **Git**.
+2. Opcional: indicá una ruta de salida. Por defecto se usa `<workspace>/backups/tesista-<fecha>.tar.gz`; las rutas relativas se resuelven contra el workspace.
+3. Marcá **Commitear el respaldo en el repositorio** para crear un commit con todos los cambios pendientes (incluidos tus documentos). Si además marcás **Subir al remoto (push)**, el commit se publica en `origin`.
+4. **Crear respaldo ahora**.
+5. El `.tar.gz` incluye la base con checkpoint del WAL, JSON de las tablas, notas en Markdown y un manifiesto.
+6. **Restaurar un respaldo**: en **Respaldos disponibles** elegí un archivo y pulsá **Restaurar**. La app reemplaza la base activa con la incluida en el `.tar.gz` y antes guarda una copia de la base actual como `tesista.db.bak-<fecha>` junto al archivo original. Después podés recargar la página si ves datos desactualizados.
 
-> `backups/` y `export/` están ignorados por Git para no versionar datos personales ni salidas generadas.
+> Si la carpeta `backups/` está en el `.gitignore` del repositorio (o el archivo se guarda fuera de él), la app avisa que el respaldo no quedó versionado. En ese caso quitá esa regla o elegí otra ruta de salida. Para restaurar en otro dispositivo, el `.tar.gz` tiene que haber llegado por Git (o copiarlo a mano) y aparecer en `<workspace>/backups/`.
 
-**Git**
+**Git: elegir el repositorio**
 
-- Muestra si el repositorio está **Limpio**, con **N cambios** o **No inicializado**.
-- **Inicializar repositorio**, **Actualizar estado**, mensaje + **Commit**, e **Historial** con **Diff** por commit.
+La app no está atada a su propio repositorio: puede versionar el repositorio de tu tesis.
+
+1. **Ruta local**: escribí la carpeta del repositorio (por ejemplo `~/Documentos/Doctorado/Tesis`) y pulsá **Usar esta carpeta**. Se aceptan rutas absolutas y `~`.
+2. **Remoto (origin)**: pegá la URL (`https://github.com/usuario/tesis.git` o `git@github.com:usuario/tesis.git`) y pulsá **Guardar remoto**. Si el repositorio todavía no existe, **Inicializar repositorio** lo crea y aplica el remoto guardado.
+3. **Estado**: muestra rama, remoto, último commit, archivos pendientes y cuántos commits faltan subir o traer.
+4. **Commit**: el mensaje es opcional; la app le agrega automáticamente la fecha y hora (`Tesista: instantánea · 2026-10-25 14:32:10`). Incluye todos los cambios pendientes del repositorio. Los archivos auxiliares de SQLite (`*.db-wal`, `*.db-shm` y las copias `*.db.bak-*`) se excluyen solos mediante `.git/info/exclude`, así el árbol no queda sucio por la base abierta.
+5. **Push**: guarda automáticamente los cambios pendientes con un commit fechado y sube la rama activa a `origin`. Requiere credenciales de Git configuradas (token, credential helper o clave SSH); si faltan, la operación falla rápido con un mensaje claro.
+6. **Pull**: trae los cambios de `origin` en modo *fast-forward*. Si hay archivos sin commitear, usá **Push** (guarda y sube) o **Commit** antes de traer. Si la rama local y la remota divergen, aparece **Traer y reemplazar**: guarda los cambios pendientes en un commit y una rama `tesista/seguridad-<fecha>`, y deja la rama igual al remoto. Es la opción recomendada cuando la base SQLite no se puede fusionar.
+7. **Historial**, **Ver diff** y **Restaurar** permiten revisar y recuperar versiones anteriores. Restaurar crea un commit nuevo con los archivos de la versión elegida (no reescribe la historia) y guarda aparte los cambios pendientes.
+8. **Restablecer** vuelve a usar la carpeta de la aplicación.
+
+> El historial muestra la fecha y hora de cada commit y marca el **Más reciente**. La restauración de un commit afecta los archivos del repositorio; si la base SQLite vive dentro de él, también se restaura y el servidor la recarga. Para recuperar solo los datos de la app desde un `.tar.gz`, usá la pestaña **Respaldos**.
+>
+> La configuración se guarda en la base SQLite (`app_settings`), así que se conserva entre reinicios. Es independiente de dónde viva `tesista.db`: los respaldos copian la base al repositorio, pero la base activa sigue en `data/`. Al hacer Pull o restaurar, la app conserva la carpeta de trabajo y el remoto de cada dispositivo.
+>
+> Si preferís no usar la interfaz, definí `TESISTA_WORKSPACE` antes de arrancar; la app lo usa cuando no hay una carpeta configurada.
+
+**Recuperar una versión anterior**
+
+- **Desde el historial**: **Restaurar** sobre cualquier commit crea uno nuevo con esos archivos. No borra nada: el estado previo sigue en el historial y, si había cambios pendientes, quedan en un commit de seguridad.
+- **Desde una rama de seguridad** (la crea «Traer y reemplazar»): listá las ramas con `git branch --list 'tesista/seguridad-*'`, mirá qué contienen con `git log --oneline <rama>` y volvé a esa versión con **Restaurar** desde la interfaz o con `git switch <rama>` (cerrá la app antes si `tesista.db` vive dentro del repositorio). Cuando ya no la necesites, borrala con `git branch -D <rama>`.
+- **Desde la copia de la base**: al restaurar un respaldo se guarda `tesista.db.bak-<fecha>` junto a la base activa. Para volver atrás, cerrá la app, renombrá ese archivo como `tesista.db` (reemplazando la base actual) y volvé a iniciar.
+
+**Trabajar desde varios dispositivos**
+
+1. En el dispositivo A: pulsá **Push**. La app guarda primero los cambios pendientes con un commit fechado y después los sube. Si además querés sincronizar los datos de la app, creá un respaldo con **Commitear** y **Subir al remoto**, o versioná `data/tesista.db` manteniendo la carpeta de trabajo en el propio proyecto.
+2. En el dispositivo B: si es la primera vez, cloná el repositorio con Git y elegí esa carpeta en **Configuración → Git**; si ya existe, pulsá **Pull**.
+3. Si el Pull rechaza por cambios locales, pulsá **Push** (guarda y sube) o usá **Traer y reemplazar** (deja una rama de seguridad).
+4. Si los datos de la app no viajaron con el repositorio, entrá en **Respaldos → Respaldos disponibles** y pulsá **Restaurar** sobre el `.tar.gz` más reciente.
+5. Al terminar de trabajar, repetí **Push** (y un respaldo si corresponde).
 
 ### 5.11 Problemas frecuentes
 
@@ -449,6 +482,14 @@ La salida incluye frontmatter YAML, citas resueltas y bibliografía. Los formato
 | «database is locked» | Otra instancia usa la misma base | Cerrá la otra instancia; los archivos `-wal`/`-shm` se regeneran solos. |
 | El DOI no se importa | DOI inexistente o API caída | Cargá la fuente a mano; el resto de la app sigue funcionando. |
 | La exportación a PDF/DOCX falla | Pandoc no instalado | Instalá Pandoc o exportá en Markdown. |
+| El push falla con «could not read Username» | Faltan credenciales para el remoto privado | Configurá un token/credential helper (`git config --global credential.helper store`) o usá una URL SSH con clave. |
+| El pull falla con «Hay cambios sin commitear» | La base SQLite o tus documentos tienen cambios sin versionar | Hacé **Commit** y volvé a intentar, o usá **Traer y reemplazar** si querés descartar lo local (queda en una rama de seguridad). |
+| El pull falla porque las ramas divergen | Hay commits locales y remotos a la vez | Pulsá **Traer y reemplazar** para adoptar el remoto; antes se guarda el estado local en un commit y una rama `tesista/seguridad-*`. |
+| No sé dónde quedó la versión que reemplacé | «Traer y reemplazar» movió la rama local | Buscá la rama con `git branch --list 'tesista/seguridad-*'` y restaurá ese commit desde el historial, o volvé a la copia `tesista.db.bak-<fecha>` si solo querés los datos. |
+| Restaurar un respaldo reemplazó datos actuales | La base activa se sobrescribió con el contenido del `.tar.gz` | La versión anterior está en `tesista.db.bak-<fecha>` (junto a la base) o en el commit/rama de seguridad. |
+| Después de restaurar veo datos viejos en pantalla | La interfaz mantiene datos cargados en memoria | Recargá la página (F5); el servidor ya reabrió la base restaurada. |
+| El respaldo se crea pero no se commitea | `backups/` está en el `.gitignore` del repositorio | Quitá esa regla o elegí otra ruta de salida dentro del workspace. |
+| «La carpeta configurada no está disponible» | El workspace se movió o desmontó | Elegí la carpeta de nuevo en **Configuración → Git** o pulsá **Restablecer**. |
 | Quiero empezar de cero | Datos de prueba | Creá un respaldo, renombrá `data/tesista.db` y reiniciá: se genera una base vacía. |
 
 ---
@@ -509,13 +550,21 @@ El backend expone los siguientes endpoints REST:
 | FTS | `/api/search/fts` | POST | Búsqueda de texto completo |
 | Integrity | `/api/integrity` | GET | Diagnóstico de integridad |
 | Stats | `/api/stats` | GET | Conteos de fuentes, citas, notas, secciones, etiquetas y enlaces |
-| Backup | `/api/backup` | POST | Crear respaldo .tar.gz (`outputPath` opcional) |
+| Workspace | `/api/workspace` | GET | Carpeta de trabajo, rama, remoto y rutas de respaldos/exportaciones |
+| Workspace | `/api/workspace` | PUT | Elegir la carpeta de trabajo (`path`; `null` restablece) |
+| Workspace | `/api/workspace/remote` | PUT | Guardar y aplicar el remoto `origin` (`url`) |
+| Backup | `/api/backup` | POST | Crear respaldo .tar.gz (`outputPath`, `commit`, `push`, `message` opcionales) |
+| Backup | `/api/backups` | GET | Listar respaldos disponibles en `<workspace>/backups` |
+| Backup | `/api/backups/restore` | POST | Restaurar un respaldo sobre la base activa (`path`) |
 | Export | `/api/export/chapter` | POST | Exportar capítulo (Markdown/LaTeX/PDF/DOCX/Typst) |
-| Git | `/api/git/status` | GET | Estado del repositorio |
-| Git | `/api/git/log?limit=` | GET | Historial de commits |
+| Git | `/api/git/status` | GET | Estado del repositorio (rama, remoto, cambios) |
+| Git | `/api/git/log?limit=` | GET | Historial de commits (fecha y hora) |
 | Git | `/api/git/diff?from=&to=&file=` | GET | Diff entre commits |
-| Git | `/api/git/commit` | POST | Crear commit |
-| Git | `/api/git/init` | POST | Inicializar repositorio |
+| Git | `/api/git/commit` | POST | Crear commit (`message` opcional; se agrega fecha y hora) |
+| Git | `/api/git/init` | POST | Inicializar repositorio y aplicar el remoto configurado |
+| Git | `/api/git/push` | POST | Subir la rama activa a `origin` |
+| Git | `/api/git/pull` | POST | Traer del remoto (`mode`: `ff-only` o `reset`) |
+| Git | `/api/git/restore` | POST | Restaurar un commit como versión nueva (`commit`) |
 | Maintenance | `/api/maintenance/vacuum` | POST | Compactar la base SQLite |
 
 ---
@@ -559,6 +608,7 @@ El backend expone los siguientes endpoints REST:
 | `saved_views` | Configuraciones de matriz y filtros guardadas |
 | `sections` | Árbol jerárquico de partes/capítulos/secciones |
 | `section_evidences` | Evidencias vinculadas a secciones con orden |
+| `app_settings` | Preferencias persistentes (`workspace_path`, `git_remote`) |
 
 ---
 
@@ -580,7 +630,7 @@ El backend expone los siguientes endpoints REST:
 - Migraciones de esquema versionadas y tests automatizados
 - Paginación en listados grandes y optimización de consultas del árbol/matriz
 - Soporte para archivos CSL externos (.csl)
-- Sincronización con Git remoto
+- Fusión asistida de dos bases SQLite cuando ambos dispositivos tienen commits nuevos (hoy se elige una versión con «Traer y reemplazar»)
 - Exportación de un archivo `.bib` separado para LaTeX
 
 ---
